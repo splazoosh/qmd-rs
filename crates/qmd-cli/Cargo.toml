@@ -1,0 +1,58 @@
+[package]
+name = "qmd-cli"
+
+[package.version]
+workspace = true
+
+[package.edition]
+workspace = true
+
+[package.rust-version]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.repository]
+workspace = true
+
+[[bin]]
+name = "qmd"
+path = "src/main.rs"
+
+[features]
+default = ["cuda"]
+llama = ["qmd/llama"]
+cuda = ["llama", "qmd/cuda"]
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["clock"]
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+
+[dependencies.qmd]
+path = "../qmd"
+
+[dependencies.qmd-archive]
+path = "../qmd-archive"
+
+[dependencies.qmd-mcp]
+path = "../qmd-mcp"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "net", "time", "signal"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- On Windows, a collection's `update` command keeps its double quotes:
+  `cmd /C` now receives it verbatim. In 0.3.0 a command such as
+  `git commit -m "a b"` or `echo x>"out file.txt"` was mangled or failed.
+- `collection rename` leaves the index untouched when the config cannot be
+  saved. In 0.3.0 the index kept the new name while the config kept the old
+  one, and the next `qmd update` indexed every file a second time.
+
 ## 0.3.0
 
 - `query --explain` shows how each result got its rank: its rank, weight,

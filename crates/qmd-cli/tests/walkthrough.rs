@@ -358,6 +358,32 @@ fn collection_rename_moves_documents_without_reindexing() {
 }
 
 #[test]
+fn collection_rename_leaves_the_index_untouched_when_the_config_cannot_be_saved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+    let config = dir.join(".qmd").join("index.yml");
+    let set_readonly = |readonly| {
+        let mut perms = std::fs::metadata(&config).unwrap().permissions();
+        perms.set_readonly(readonly);
+        std::fs::set_permissions(&config, perms).unwrap();
+    };
+
+    set_readonly(true);
+    let out = qmd(dir, &["collection", "rename", "docs", "notes"]);
+    set_readonly(false);
+    assert!(!out.status.success());
+
+    let out = ok(dir, &["update"]);
+    assert!(out.contains("0 new, 0 updated, 3 unchanged"), "{out}");
+    let out = ok(dir, &["ls"]);
+    assert!(
+        out.contains("qmd://docs/") && !out.contains("notes"),
+        "{out}"
+    );
+}
+
+#[test]
 fn collection_show_update_cmd_include_and_exclude() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -432,6 +458,28 @@ fn update_runs_a_local_update_command_only_when_trusted() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
     assert!(stdout.contains("    hook-ran"), "{stdout}");
+
+    ok(
+        dir,
+        &[
+            "collection",
+            "update-cmd",
+            "docs",
+            "echo",
+            "\"a b\">\"quoted out.txt\"",
+        ],
+    );
+    let out = trusted(&["update"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let written = std::fs::read_to_string(dir.join("docs/quoted out.txt")).unwrap();
+    assert!(
+        written.contains("a b") && !written.contains('\\'),
+        "{written}"
+    );
 
     ok(dir, &["collection", "update-cmd", "docs", "exit", "3"]);
     let out = trusted(&["update"]);

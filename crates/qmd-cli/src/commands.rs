@@ -404,7 +404,12 @@ pub fn collection_rename(location: &IndexLocation, old: &str, new: &str) -> Resu
     }
     let moved = app.store.rename_collection(old, new)?;
     app.config.rename_collection(old, new);
-    config::save_config(&app.config_path, &app.config)?;
+    if let Err(e) = config::save_config(&app.config_path, &app.config) {
+        app.store
+            .rename_collection(new, old)
+            .context("config save failed and the database rename could not be undone")?;
+        return Err(e.into());
+    }
     app.store.sync_config_to_db(&app.config)?;
     println!("✓ Renamed collection '{old}' to '{new}' ({moved} documents)");
     println!("  Virtual paths: qmd://{old}/ → qmd://{new}/");
@@ -535,16 +540,7 @@ fn run_update_command(location: &IndexLocation, root: &Path, command: &str) -> R
         return Ok(());
     }
     println!("{}    Running update command: {command}{}", c.dim, c.reset);
-    let mut shell = if cfg!(windows) {
-        let mut shell = std::process::Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    } else {
-        let mut shell = std::process::Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
-    };
-    let output = shell
+    let output = shell_command(command)
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .output()
@@ -563,6 +559,23 @@ fn run_update_command(location: &IndexLocation, root: &Path, command: &str) -> R
         .into());
     }
     Ok(())
+}
+
+/// `cmd /C` reads the rest of its command line verbatim and does not undo
+/// `arg`'s MSVC quoting, so the command goes in raw.
+#[cfg(windows)]
+fn shell_command(command: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut shell = std::process::Command::new("cmd");
+    shell.arg("/C").raw_arg(command);
+    shell
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("sh");
+    shell.arg("-c").arg(command);
+    shell
 }
 
 pub fn update(location: &IndexLocation) -> Result<()> {

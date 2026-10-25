@@ -5,6 +5,8 @@ mod commands;
 mod daemon;
 mod format;
 
+use std::sync::atomic::{AtomicI32, Ordering};
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -230,6 +232,9 @@ fn main() {
     quiet_on_closed_stdout();
     qmd::store::enable_production_mode();
     let cli = Cli::parse();
+    if !cli.command.is_read_only() {
+        CLOSED_STDOUT_EXIT.store(Exit::CLOSED_STDOUT_CUT_SHORT, Ordering::Relaxed);
+    }
     let location = commands::IndexLocation::resolve(cli.index.as_deref());
     let result: Result<()> = match cli.command {
         Command::Init => commands::init(),
@@ -317,18 +322,52 @@ fn main() {
     }
 }
 
-/// Ends the process with status 0, and no panic message, when `println!`
-/// panics because the reader of stdout has gone (`qmd status | head`); any
-/// other panic goes to the default hook.
+/// The status `quiet_on_closed_stdout` exits with: 0 until a command that
+/// changes state is parsed.
+static CLOSED_STDOUT_EXIT: AtomicI32 = AtomicI32::new(0);
+
+/// Ends the process with no panic message when `println!` panics because the
+/// reader of stdout has gone (`qmd status | head`): status 0 for a read-only
+/// command, `Exit::CLOSED_STDOUT_CUT_SHORT` for one whose work stopped partway.
+/// Any other panic goes to the default hook.
 fn quiet_on_closed_stdout() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let message = info.payload().downcast_ref::<String>();
         if message.is_some_and(|m| is_closed_stdout(m)) {
-            std::process::exit(0);
+            std::process::exit(CLOSED_STDOUT_EXIT.load(Ordering::Relaxed));
         }
         default(info);
     }));
+}
+
+impl Command {
+    /// Whether the command leaves the index, config, archive, model cache and
+    /// daemon as it found them. The rerank cache a query fills does not count.
+    fn is_read_only(&self) -> bool {
+        match self {
+            Command::Status
+            | Command::Drift
+            | Command::Query { .. }
+            | Command::Search { .. }
+            | Command::Vsearch { .. }
+            | Command::Get { .. }
+            | Command::Ls { .. } => true,
+            Command::Collection { command } => matches!(command, CollectionCommand::List),
+            Command::Archive { command, .. } => matches!(
+                command,
+                Some(
+                    ArchiveCommand::List
+                        | ArchiveCommand::Show { .. }
+                        | ArchiveCommand::Verify { .. }
+                )
+            ),
+            Command::Mcp {
+                command, daemon, ..
+            } => command.is_none() && !daemon,
+            Command::Init | Command::Update | Command::Embed { .. } | Command::Pull { .. } => false,
+        }
+    }
 }
 
 /// Whether a panic message is std's "failed printing to stdout" for a broken
@@ -357,6 +396,9 @@ impl Exit {
     /// `qmd archive <url>` found the extract changed and, without `--update`,
     /// stored nothing.
     pub const CHANGED_NOT_STORED: i32 = 3;
+    /// A command that changes state lost the reader of its stdout and stopped
+    /// partway: 128 + SIGPIPE, what a shell reports for a Unix tool killed by it.
+    pub const CLOSED_STDOUT_CUT_SHORT: i32 = 141;
 }
 
 impl std::fmt::Display for Exit {

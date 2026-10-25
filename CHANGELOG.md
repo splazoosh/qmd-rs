@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- **Narrows 0.2.1:** when the reader of its output goes away, `qmd` exits with
+  status 0 only for a read-only command: `status`, `drift`, `search`,
+  `vsearch`, `query`, `get`, `ls`, `collection list`, `archive list`,
+  `archive show`, `archive verify`, and `mcp` served in the foreground. Every
+  other command (`init`, `update`, `embed`, `pull`, `collection add`,
+  `collection remove`, `archive <url>`, `archive index`, `mcp --daemon`,
+  `mcp stop`) exits 141, as a Unix tool killed by SIGPIPE does, so a pipeline
+  can tell that its work stopped partway. No panic message either way.
+
 ## 0.2.1
 
 - `qmd` exits quietly with status 0 when the reader of its output goes away

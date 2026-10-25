@@ -205,19 +205,38 @@ fn init_refuses_home_directory() {
     );
 }
 
-#[test]
-fn closed_stdout_exits_quietly() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    ok(dir, &["init"]);
-    let mut child = command(dir, &["status"])
+/// Runs `qmd args` with the read end of its stdout closed before qmd writes,
+/// as `head` does once it has its lines; returns the exit code and stderr.
+fn run_with_closed_stdout(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut child = command(dir, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("qmd binary runs");
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{:?}\nstderr: {stderr}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(!stderr.contains("panicked"), "{stderr}");
+    (out.status.code(), stderr)
+}
+
+#[test]
+fn closed_stdout_exits_zero_for_a_read_only_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ok(dir, &["init"]);
+    let (code, stderr) = run_with_closed_stdout(dir, &["status"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn closed_stdout_exits_141_for_a_state_changing_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ok(dir, &["init"]);
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("a.md"), "# A\n\nalpha\n").unwrap();
+    let (code, stderr) = run_with_closed_stdout(dir, &["collection", "add", "docs"]);
+    assert_eq!(code, Some(141), "stderr: {stderr}");
 }

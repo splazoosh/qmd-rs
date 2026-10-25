@@ -97,6 +97,11 @@ pub struct QueryParams {
     /// to the index config, else false.
     #[serde(default)]
     pub rerank: Option<bool>,
+    /// Attach to each result how it got its rank: its rank and score in each
+    /// BM25 and vector list, the fused RRF score and rank, and the rerank
+    /// blend when reranking ran (default: false). Changes no ranking.
+    #[serde(default)]
+    pub explain: Option<bool>,
 }
 
 /// BM25 term combination for `query`.
@@ -132,6 +137,13 @@ pub struct QueryHit {
     pub line: usize,
     /// The matching lines, with line numbers.
     pub snippet: String,
+    /// The ranking trace, when `explain` asked for it: `contributions` (one
+    /// per ranked list: `backend`, `kind`, `query`, `rank`, `weight`,
+    /// `backend_score`, `rrf`), `rrf_base`, `rrf_bonus`, `rrf_score`,
+    /// `rrf_rank`, `position_score`, `rerank` (`rerank_score`,
+    /// `fused_weight`) and `final_score`, all unrounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<serde_json::Value>,
 }
 
 /// The `query` tool's structured content.
@@ -186,6 +198,7 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
             .map(TermMatch::from)
             .or(settings.term_match)
             .unwrap_or_default(),
+        explain: params.explain.unwrap_or(false),
         ..HybridOptions::default()
     };
 
@@ -228,7 +241,11 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
         .iter()
         .map(|r| hit(r, &display_query, params.intent.as_deref()))
         .collect();
-    let summary = summarize(&hits, &display_query);
+    let traces: Vec<Option<String>> = results
+        .iter()
+        .map(|r| r.explain.as_ref().map(ToString::to_string))
+        .collect();
+    let summary = summarize(&hits, &traces, &display_query);
 
     let (arm, logged) = if typed.is_empty() {
         (Arm::Hybrid, params.query.clone().unwrap_or_default())
@@ -262,19 +279,26 @@ fn hit(r: &HybridResult, display_query: &str, intent: Option<&str>) -> QueryHit 
         context: r.context.clone(),
         line: snippet.line,
         snippet: snippet.numbered(),
+        explain: r
+            .explain
+            .as_ref()
+            .map(|e| serde_json::to_value(e).expect("explain serializes")),
     }
 }
 
-fn summarize(hits: &[QueryHit], display_query: &str) -> String {
+/// The text block: each hit, with its trace (as `qmd query --explain` prints
+/// it) between the header and the snippet when there is one.
+fn summarize(hits: &[QueryHit], traces: &[Option<String>], display_query: &str) -> String {
     if hits.is_empty() {
         return format!("No results for: {display_query}");
     }
     let mut out = format!("{} results for: {display_query}\n", hits.len());
-    for h in hits {
-        out.push_str(&format!(
-            "\n{} {} ({:.2})\n{}\n",
-            h.docid, h.file, h.score, h.snippet
-        ));
+    for (h, trace) in hits.iter().zip(traces) {
+        out.push_str(&format!("\n{} {} ({:.2})\n", h.docid, h.file, h.score));
+        if let Some(trace) = trace {
+            out.push_str(&format!("Explain:\n{trace}\n"));
+        }
+        out.push_str(&format!("{}\n", h.snippet));
     }
     out
 }

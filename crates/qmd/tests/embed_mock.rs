@@ -150,3 +150,47 @@ fn collection_chunk_boundary_reembeds_and_replaces_the_old_set() {
         .unwrap();
     assert_eq!(stale, 0, "no window-cut chunk survives");
 }
+
+#[test]
+fn cleanup_removes_orphaned_vectors_and_leaves_nothing_to_re_embed() {
+    let store = common::indexed_store();
+    let mock = MockEmbedder::default();
+    generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert_eq!(
+        store.preview_cleanup().unwrap(),
+        qmd::store::CleanupStats::default()
+    );
+
+    store
+        .deactivate_document("eval-docs", "machine-learning-primer.md")
+        .unwrap();
+    let preview = store.preview_cleanup().unwrap();
+    assert!(preview.orphaned_vectors > 0, "{preview:?}");
+    assert_eq!(preview.inactive_docs, 1);
+    assert_eq!(preview.orphaned_content, 1);
+
+    let removed = store.cleanup().unwrap();
+    assert_eq!(removed, preview);
+    assert_eq!(
+        store.preview_cleanup().unwrap(),
+        qmd::store::CleanupStats::default()
+    );
+    let dangling: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vectors_vec", [], |r| r.get(0))
+        .unwrap();
+    let recorded: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM content_vectors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        dangling, recorded,
+        "vec0 rows and their records leave together"
+    );
+
+    let again = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert_eq!(
+        again.docs_processed, 0,
+        "the active documents keep their vectors"
+    );
+}

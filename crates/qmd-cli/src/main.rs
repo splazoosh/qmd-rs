@@ -55,8 +55,17 @@ enum Command {
         #[arg(long = "drop")]
         drop: Vec<String>,
     },
-    /// Re-index all collections
+    /// Re-index all collections, running each one's update command first
+    /// (see `collection update-cmd`)
     Update,
+    /// Tidy the index: clear cached rerank scores, delete vectors no active
+    /// document uses, inactive document rows and unreferenced content, then
+    /// compact FTS and VACUUM. Nothing needs re-embedding afterwards
+    Cleanup {
+        /// Report what would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Report new, changed, and gone files without touching the index
     Drift,
     /// Hybrid search: BM25 + vector search fused with RRF. Also accepts
@@ -74,6 +83,11 @@ enum Command {
         /// Do not rerank, whatever the config says
         #[arg(long)]
         no_rerank: bool,
+        /// Show how each result got its rank: its rank and score in each
+        /// BM25 and vector list, the fused RRF score and rank, and the rerank
+        /// blend when reranking ran (cli and json formats)
+        #[arg(long)]
+        explain: bool,
         #[command(flatten)]
         output: SearchOptions,
     },
@@ -200,6 +214,44 @@ enum CollectionCommand {
         /// Collection name
         name: String,
     },
+    /// Rename a collection; its documents move to qmd://<new>/ with no
+    /// re-index and no re-embed
+    #[command(visible_alias = "mv")]
+    Rename {
+        /// Current name
+        old: String,
+        /// New name
+        new: String,
+    },
+    /// Show one collection's settings and document count
+    #[command(visible_alias = "info")]
+    Show {
+        /// Collection name
+        name: String,
+    },
+    /// Set the shell command `qmd update` runs in the collection's directory
+    /// before indexing it (e.g. 'git pull'); omit it to clear. Runs through
+    /// `sh -c`, or `cmd /C` on Windows (TS qmd: `bash -c`). Under a
+    /// project-local .qmd config it runs only when QMD_TRUST_LOCAL_CONFIG=1
+    /// (TS qmd asks to trust the config instead)
+    #[command(name = "update-cmd", visible_alias = "set-update")]
+    UpdateCmd {
+        /// Collection name
+        name: String,
+        /// The command; its words are joined with spaces
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Include a collection in queries that name none
+    Include {
+        /// Collection name
+        name: String,
+    },
+    /// Leave a collection out of queries that name none; -c still searches it
+    Exclude {
+        /// Collection name
+        name: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -258,7 +310,21 @@ fn main() {
             ),
             CollectionCommand::List => commands::collection_list(&location),
             CollectionCommand::Remove { name } => commands::collection_remove(&location, &name),
+            CollectionCommand::Rename { old, new } => {
+                commands::collection_rename(&location, &old, &new)
+            }
+            CollectionCommand::Show { name } => commands::collection_show(&location, &name),
+            CollectionCommand::UpdateCmd { name, command } => {
+                commands::collection_update_cmd(&location, &name, &command.join(" "))
+            }
+            CollectionCommand::Include { name } => {
+                commands::collection_include(&location, &name, true)
+            }
+            CollectionCommand::Exclude { name } => {
+                commands::collection_include(&location, &name, false)
+            }
         },
+        Command::Cleanup { dry_run } => commands::cleanup(&location, dry_run),
         Command::Archive {
             command,
             url,
@@ -281,6 +347,7 @@ fn main() {
             intent,
             rerank,
             no_rerank,
+            explain,
             output,
         } => {
             let rerank = match (rerank, no_rerank) {
@@ -288,7 +355,14 @@ fn main() {
                 (_, true) => Some(false),
                 _ => None,
             };
-            commands::query(&location, &query, intent.as_deref(), rerank, &output)
+            commands::query(
+                &location,
+                &query,
+                intent.as_deref(),
+                rerank,
+                explain,
+                &output,
+            )
         }
         Command::Search { query, output } => commands::search(&location, &query, &output),
         Command::Vsearch { query, output } => commands::vsearch(&location, &query, &output),
@@ -342,8 +416,9 @@ fn quiet_on_closed_stdout() {
 }
 
 impl Command {
-    /// Whether the command leaves the index, config, archive, model cache and
-    /// daemon as it found them. The rerank cache a query fills does not count.
+    /// Whether the command changes no state once it has started writing stdout,
+    /// so a closed stdout cannot leave its work half done. A search may still
+    /// download a model or fill the rerank cache, but finishes both first.
     fn is_read_only(&self) -> bool {
         match self {
             Command::Status
@@ -353,7 +428,11 @@ impl Command {
             | Command::Vsearch { .. }
             | Command::Get { .. }
             | Command::Ls { .. } => true,
-            Command::Collection { command } => matches!(command, CollectionCommand::List),
+            Command::Collection { command } => matches!(
+                command,
+                CollectionCommand::List | CollectionCommand::Show { .. }
+            ),
+            Command::Cleanup { dry_run } => *dry_run,
             Command::Archive { command, .. } => matches!(
                 command,
                 Some(

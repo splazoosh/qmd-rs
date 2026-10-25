@@ -43,14 +43,20 @@ pub trait Reranker {
 ///
 /// `rrf_rank` is 1-based; the fused term is `1 / rrf_rank`.
 pub fn blend(rrf_rank: usize, rerank_score: f64) -> f64 {
-    let fused_weight = match rrf_rank {
-        0..=3 => 0.75,
-        4..=10 => 0.60,
-        _ => 0.40,
-    };
+    let fused_weight = blend_fused_weight(rrf_rank);
     #[allow(clippy::cast_precision_loss)]
     let fused = 1.0 / rrf_rank.max(1) as f64;
     fused_weight * fused + (1.0 - fused_weight) * rerank_score
+}
+
+/// The fused term's weight in [`blend`] at `rrf_rank`; the rerank score gets
+/// the rest.
+pub fn blend_fused_weight(rrf_rank: usize) -> f64 {
+    match rrf_rank {
+        0..=3 => 0.75,
+        4..=10 => 0.60,
+        _ => 0.40,
+    }
 }
 
 fn cache_key(model: &str, query: &str, document: &str) -> String {

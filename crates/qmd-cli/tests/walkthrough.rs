@@ -240,3 +240,241 @@ fn closed_stdout_exits_141_for_a_state_changing_command() {
     let (code, stderr) = run_with_closed_stdout(dir, &["collection", "add", "docs"]);
     assert_eq!(code, Some(141), "stderr: {stderr}");
 }
+
+/// A local index over `docs/` with three documents, embedded by the mock.
+fn embedded_corpus(dir: &Path) {
+    ok(dir, &["init"]);
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("raft.md"),
+        "# Raft Consensus\n\nRaft elects a leader; followers replicate the log.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("bread.md"),
+        "# Sourdough Basics\n\nFeed the starter, fold the dough.\n",
+    )
+    .unwrap();
+    std::fs::write(docs.join("tea.md"), "# Brewing Tea\n\nSteep green tea.\n").unwrap();
+    ok(dir, &["collection", "add", "docs", "--name", "docs"]);
+    ok(dir, &["embed"]);
+}
+
+#[test]
+fn query_explain_prints_the_trace_with_and_without_rerank() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+
+    let plain = ok(dir, &["query", "raft leader", "--format", "json"]);
+    assert!(!plain.contains("\"explain\""), "{plain}");
+    let plain: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    let ranking = |v: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["file"].clone(), r["score"].clone()))
+            .collect()
+    };
+
+    for rerank in ["--no-rerank", "--rerank"] {
+        let out = ok(dir, &["query", "raft leader", "--explain", rerank]);
+        assert!(out.contains("Explain:"), "{out}");
+        assert!(out.contains("fts original #1"), "{out}");
+        assert!(out.contains("rrf: base="), "{out}");
+        let blend = if rerank == "--rerank" {
+            "x rerank"
+        } else {
+            "(no rerank)"
+        };
+        assert!(out.contains(blend), "{out}");
+
+        let json = ok(
+            dir,
+            &[
+                "query",
+                "raft leader",
+                "--explain",
+                rerank,
+                "--format",
+                "json",
+            ],
+        );
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows[0]["file"], "docs/raft.md");
+        assert_eq!(rows[0]["explain"]["rrf_rank"], 1);
+        assert_eq!(
+            rows[0]["explain"]["rerank"].is_null(),
+            rerank == "--no-rerank"
+        );
+        if rerank == "--no-rerank" {
+            assert_eq!(
+                ranking(&rows),
+                ranking(&plain),
+                "explain changes no ranking"
+            );
+        }
+    }
+}
+
+#[test]
+fn collection_rename_moves_documents_without_reindexing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+
+    let out = ok(dir, &["collection", "rename", "docs", "notes"]);
+    assert!(
+        out.contains("Renamed collection 'docs' to 'notes' (3 documents)"),
+        "{out}"
+    );
+    let config = std::fs::read_to_string(dir.join(".qmd").join("index.yml")).unwrap();
+    assert!(
+        config.contains("notes:") && !config.contains("docs:"),
+        "{config}"
+    );
+
+    let out = ok(dir, &["update"]);
+    assert!(out.contains("0 new, 0 updated, 3 unchanged"), "{out}");
+    let out = ok(dir, &["status"]);
+    assert!(!out.contains("need embedding"), "{out}");
+    let out = ok(
+        dir,
+        &["query", "raft leader", "--format", "files", "-c", "notes"],
+    );
+    assert!(out.contains("notes/raft.md"), "{out}");
+
+    assert!(
+        !qmd(dir, &["collection", "rename", "missing", "x"])
+            .status
+            .success()
+    );
+    assert!(
+        !qmd(dir, &["collection", "rename", "notes", "bad name"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn collection_show_update_cmd_include_and_exclude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+
+    let out = ok(dir, &["collection", "show", "docs"]);
+    assert!(out.contains("Collection: docs"), "{out}");
+    assert!(out.contains("Include:  yes (default)"), "{out}");
+    assert!(
+        out.contains("Chunks:   900 tokens, window boundary"),
+        "{out}"
+    );
+    assert!(out.contains("Files:    3"), "{out}");
+    assert!(!out.contains("Update:"), "{out}");
+
+    let out = ok(
+        dir,
+        &["collection", "update-cmd", "docs", "echo", "hook-ran"],
+    );
+    assert!(
+        out.contains("Set update command for 'docs': echo hook-ran"),
+        "{out}"
+    );
+    let out = ok(dir, &["collection", "show", "docs"]);
+    assert!(out.contains("Update:   echo hook-ran"), "{out}");
+    let out = ok(dir, &["collection", "update-cmd", "docs"]);
+    assert!(out.contains("Cleared update command"), "{out}");
+    let config = std::fs::read_to_string(dir.join(".qmd").join("index.yml")).unwrap();
+    assert!(!config.contains("update:"), "{config}");
+
+    ok(dir, &["collection", "exclude", "docs"]);
+    let out = ok(dir, &["collection", "show", "docs"]);
+    assert!(out.contains("Include:  no"), "{out}");
+    assert!(
+        !qmd(dir, &["query", "raft"]).status.success(),
+        "no collection is left to search by default"
+    );
+    let out = ok(dir, &["query", "raft", "-c", "docs", "--format", "files"]);
+    assert!(out.contains("docs/raft.md"), "{out}");
+    ok(dir, &["collection", "include", "docs"]);
+    let out = ok(dir, &["query", "raft", "--format", "files"]);
+    assert!(out.contains("docs/raft.md"), "{out}");
+
+    assert!(
+        !qmd(dir, &["collection", "show", "missing"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn update_runs_a_local_update_command_only_when_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+    ok(
+        dir,
+        &["collection", "update-cmd", "docs", "echo", "hook-ran"],
+    );
+
+    let out = ok(dir, &["update"]);
+    assert!(out.contains("Skipped update command"), "{out}");
+    assert!(!out.contains("    hook-ran"), "{out}");
+
+    let trusted = |args: &[&str]| {
+        command(dir, args)
+            .env("QMD_TRUST_LOCAL_CONFIG", "1")
+            .output()
+            .unwrap()
+    };
+    let out = trusted(&["update"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("    hook-ran"), "{stdout}");
+
+    ok(dir, &["collection", "update-cmd", "docs", "exit", "3"]);
+    let out = trusted(&["update"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the command's status stops the update"
+    );
+}
+
+#[test]
+fn cleanup_removes_what_its_dry_run_reports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+
+    let out = ok(dir, &["cleanup", "--dry-run"]);
+    assert!(
+        out.contains("Would remove 0 orphaned embedding chunks"),
+        "{out}"
+    );
+
+    std::fs::remove_file(dir.join("docs").join("tea.md")).unwrap();
+    ok(dir, &["update"]);
+    let out = ok(dir, &["cleanup", "--dry-run"]);
+    assert!(
+        out.contains("Would remove 1 orphaned embedding chunks"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Would remove 1 inactive document records"),
+        "{out}"
+    );
+
+    let out = ok(dir, &["cleanup"]);
+    assert!(out.contains("Removed 1 orphaned embedding chunks"), "{out}");
+    assert!(out.contains("Removed 1 inactive document records"), "{out}");
+    assert!(out.contains("FTS compacted, database vacuumed"), "{out}");
+    let out = ok(dir, &["cleanup", "--dry-run"]);
+    assert!(
+        out.contains("Would remove 0 orphaned embedding chunks"),
+        "{out}"
+    );
+    let out = ok(dir, &["status"]);
+    assert!(!out.contains("need embedding"), "{out}");
+}

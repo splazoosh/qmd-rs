@@ -3,7 +3,7 @@
 
 use std::io::IsTerminal;
 
-use qmd::query::HybridResult;
+use qmd::query::{Explain, HybridResult};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
 use qmd::store::SearchResult;
 
@@ -78,6 +78,7 @@ pub struct ResultView<'a> {
     pub context: Option<&'a str>,
     pub chunk_pos: Option<usize>,
     pub chunk_len: Option<usize>,
+    pub explain: Option<&'a Explain>,
 }
 
 impl<'a> From<&'a SearchResult> for ResultView<'a> {
@@ -91,6 +92,7 @@ impl<'a> From<&'a SearchResult> for ResultView<'a> {
             context: r.context.as_deref(),
             chunk_pos: None,
             chunk_len: None,
+            explain: None,
         }
     }
 }
@@ -106,6 +108,7 @@ impl<'a> From<&'a HybridResult> for ResultView<'a> {
             context: r.context.as_deref(),
             chunk_pos: Some(r.best_chunk_pos),
             chunk_len: Some(r.best_chunk.len()),
+            explain: r.explain.as_ref(),
         }
     }
 }
@@ -166,6 +169,12 @@ fn print_result_views(
                     } else {
                         obj.insert("snippet".into(), snippet.text.into());
                     }
+                    if let Some(explain) = r.explain {
+                        obj.insert(
+                            "explain".into(),
+                            serde_json::to_value(explain).expect("explain serializes"),
+                        );
+                    }
                     serde_json::Value::Object(obj)
                 })
                 .collect();
@@ -221,6 +230,9 @@ fn print_result_views(
                     println!("{}Context: {}{}", c.dim, ctx, c.reset);
                 }
                 println!("Score: {}{:.2}{}", c.bold, r.score, c.reset);
+                if let Some(explain) = r.explain {
+                    println!("{}Explain:\n{explain}{}", c.dim, c.reset);
+                }
                 println!();
                 let content = if full { r.body } else { snippet.text.as_str() };
                 println!("{content}");

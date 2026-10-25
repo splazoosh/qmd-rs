@@ -335,6 +335,75 @@ fn rerank_reorders_by_blend_and_reports() {
     assert_eq!(again.report.rerank_fresh, 0);
 }
 
+#[test]
+fn explain_traces_each_result_and_changes_no_ranking() {
+    use qmd::query::{Backend, HybridResult};
+    use qmd::rerank::MockReranker;
+    let (store, mock) = embedded_store();
+    let plain = HybridOptions::default();
+    let explained = HybridOptions {
+        explain: true,
+        ..HybridOptions::default()
+    };
+    let ranking = |rs: &[HybridResult]| -> Vec<(String, u64)> {
+        rs.iter()
+            .map(|r| (r.filepath.clone(), r.score.to_bits()))
+            .collect()
+    };
+
+    for reranker in [None, Some(&MockReranker as &dyn qmd::rerank::Reranker)] {
+        let off = hybrid_query(&store, Some(&mock), reranker, "CAP theorem", &plain).unwrap();
+        let on = hybrid_query(&store, Some(&mock), reranker, "CAP theorem", &explained).unwrap();
+        assert_eq!(ranking(&off.results), ranking(&on.results));
+        assert!(off.results.iter().all(|r| r.explain.is_none()));
+        for r in &on.results {
+            let e = r.explain.as_ref().expect("every result is traced");
+            assert_eq!(e.rrf_rank, r.rrf_rank);
+            assert_eq!(e.final_score.to_bits(), r.score.to_bits());
+            assert!(!e.contributions.is_empty());
+            let base: f64 = e.contributions.iter().map(|c| c.rrf).sum();
+            assert!((base - e.rrf_base).abs() < 1e-12);
+            assert_eq!(e.rerank.is_some(), reranker.is_some());
+            if let Some(t) = &e.rerank {
+                assert_eq!(Some(t.rerank_score), r.rerank_score);
+            }
+            let text = e.to_string();
+            assert!(text.contains("rrf: base="), "{text}");
+            assert!(
+                text.contains(if reranker.is_some() {
+                    "x rerank"
+                } else {
+                    "(no rerank)"
+                }),
+                "{text}"
+            );
+        }
+        let top = on.results[0].explain.as_ref().unwrap();
+        assert!(
+            top.contributions
+                .iter()
+                .any(|c| c.source.backend == Backend::Fts)
+        );
+    }
+
+    let parsed = parse_structured_query("lex: CAP theorem\nvec: consistency tradeoffs")
+        .unwrap()
+        .unwrap();
+    let on = structured_search(&store, Some(&mock), None, &parsed.searches, &explained).unwrap();
+    let kinds: Vec<&str> = on
+        .results
+        .iter()
+        .flat_map(|r| r.explain.as_ref().unwrap().contributions.iter())
+        .map(|c| c.source.kind)
+        .collect();
+    assert!(
+        kinds.contains(&"lex") && kinds.contains(&"vec"),
+        "{kinds:?}"
+    );
+    let json = serde_json::to_value(on.results[0].explain.as_ref().unwrap()).unwrap();
+    assert!(json["contributions"][0]["backend"].is_string(), "{json}");
+}
+
 /// Two concepts: `zebra`/`striped` on one axis and, in documents only,
 /// `animal` on another, so a query naming both lands on the zebra chunk.
 struct ConceptEmbedder;

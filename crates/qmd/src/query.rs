@@ -10,10 +10,12 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use crate::chunk::{Chunk, chunk_document_for, token_chunks_at};
 use crate::embed::{Embedder, format_query_for_embedding};
 use crate::error::{Error, Result};
-use crate::rerank::{Reranker, blend, rerank_cached};
+use crate::rerank::{Reranker, blend, blend_fused_weight, rerank_cached};
 use crate::snippet::extract_intent_terms;
 use crate::store::{SearchResult, Store, TermMatch};
 
@@ -288,6 +290,183 @@ pub fn reciprocal_rank_fusion(
         .collect()
 }
 
+/// The backend a ranked list came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// BM25 over FTS5.
+    Fts,
+    /// Vector KNN.
+    Vec,
+}
+
+/// What produced one ranked list: a backend and the query it ran.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListSource {
+    pub backend: Backend,
+    /// `original` for the plain query, else the typed line's `lex`, `vec` or
+    /// `hyde`.
+    pub kind: &'static str,
+    pub query: String,
+}
+
+/// One ranked list's share of a result's fused score.
+#[derive(Debug, Clone, Serialize)]
+pub struct Contribution {
+    #[serde(flatten)]
+    pub source: ListSource,
+    /// 1-based rank in that list.
+    pub rank: usize,
+    /// The list's RRF weight.
+    pub weight: f64,
+    /// The backend's normalized score (BM25 `|s|/(1+|s|)`, or cosine
+    /// similarity).
+    pub backend_score: f64,
+    /// `weight / (k + rank)`.
+    pub rrf: f64,
+}
+
+/// How the rerank blend set a result's final score.
+#[derive(Debug, Clone, Serialize)]
+pub struct RerankTrace {
+    pub rerank_score: f64,
+    /// Weight of `1/rrf_rank`; the rerank score gets `1 - fused_weight`.
+    pub fused_weight: f64,
+}
+
+/// Why a result sits where it does: each list's contribution, the fused RRF
+/// score and rank, and the final score. Built beside fusion, never fed back
+/// into it, so asking for it changes no ranking or score.
+#[derive(Debug, Clone, Serialize)]
+pub struct Explain {
+    pub contributions: Vec<Contribution>,
+    /// Sum of the contributions.
+    pub rrf_base: f64,
+    /// +0.05 for a first place in any list, +0.02 for a second or third.
+    pub rrf_bonus: f64,
+    /// `rrf_base + rrf_bonus`, the score fusion sorted by.
+    pub rrf_score: f64,
+    /// 1-based rank after fusion.
+    pub rrf_rank: usize,
+    /// `1 / rrf_rank`, the final score when nothing reranked.
+    pub position_score: f64,
+    /// Present when the reranker ran.
+    pub rerank: Option<RerankTrace>,
+    pub final_score: f64,
+}
+
+impl std::fmt::Display for Explain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in &self.contributions {
+            let query = if c.source.kind == "original" {
+                String::new()
+            } else {
+                format!(" \"{}\"", preview(&c.source.query, 40))
+            };
+            writeln!(
+                f,
+                "  {:<3} {}{query} #{} x{} score={:.4} rrf={:.5}",
+                match c.source.backend {
+                    Backend::Fts => "fts",
+                    Backend::Vec => "vec",
+                },
+                c.source.kind,
+                c.rank,
+                c.weight,
+                c.backend_score,
+                c.rrf
+            )?;
+        }
+        writeln!(
+            f,
+            "  rrf: base={:.5} + bonus={:.2} = {:.5}, fused rank {}",
+            self.rrf_base, self.rrf_bonus, self.rrf_score, self.rrf_rank
+        )?;
+        match &self.rerank {
+            None => write!(
+                f,
+                "  final: 1/{} = {:.4} (no rerank)",
+                self.rrf_rank, self.final_score
+            ),
+            Some(r) => write!(
+                f,
+                "  final: {:.2} x 1/{} + {:.2} x rerank {:.4} = {:.4}",
+                r.fused_weight,
+                self.rrf_rank,
+                1.0 - r.fused_weight,
+                r.rerank_score,
+                self.final_score
+            ),
+        }
+    }
+}
+
+fn preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        format!(
+            "{}...",
+            text.chars().take(max_chars - 3).collect::<String>()
+        )
+    }
+}
+
+/// Per-file traces of [`reciprocal_rank_fusion`] over the same lists, keyed
+/// by filepath, with the RRF fields set and the rank and final fields left
+/// for [`finalize_candidates`]. The sums run in fusion's order, so
+/// `rrf_score` equals the fused score exactly.
+fn rrf_traces(
+    lists: &[Vec<SearchResult>],
+    weights: &[f64],
+    sources: &[ListSource],
+    k: f64,
+) -> HashMap<String, Explain> {
+    let mut traces: HashMap<String, (Explain, usize)> = HashMap::new();
+    for (list_idx, list) in lists.iter().enumerate() {
+        let weight = weights.get(list_idx).copied().unwrap_or(1.0);
+        for (rank, result) in list.iter().enumerate() {
+            let contribution = Contribution {
+                source: sources[list_idx].clone(),
+                rank: rank + 1,
+                weight,
+                backend_score: result.score,
+                rrf: weight / (k + rank as f64 + 1.0),
+            };
+            let (trace, top_rank) = traces.entry(result.filepath.clone()).or_insert_with(|| {
+                (
+                    Explain {
+                        contributions: Vec::new(),
+                        rrf_base: 0.0,
+                        rrf_bonus: 0.0,
+                        rrf_score: 0.0,
+                        rrf_rank: 0,
+                        position_score: 0.0,
+                        rerank: None,
+                        final_score: 0.0,
+                    },
+                    rank,
+                )
+            });
+            trace.rrf_base += contribution.rrf;
+            *top_rank = (*top_rank).min(rank);
+            trace.contributions.push(contribution);
+        }
+    }
+    traces
+        .into_iter()
+        .map(|(file, (mut trace, top_rank))| {
+            trace.rrf_bonus = match top_rank {
+                0 => 0.05,
+                1 | 2 => 0.02,
+                _ => 0.0,
+            };
+            trace.rrf_score = trace.rrf_base + trace.rrf_bonus;
+            (file, trace)
+        })
+        .collect()
+}
+
 /// Options shared by [`hybrid_query`] and [`structured_search`].
 #[derive(Debug, Clone)]
 pub struct HybridOptions {
@@ -303,6 +482,8 @@ pub struct HybridOptions {
     pub term_match: TermMatch,
     /// Which chunk of each candidate the reranker reads.
     pub rerank_chunk: RerankChunk,
+    /// Attach an [`Explain`] trace to each result.
+    pub explain: bool,
 }
 
 impl Default for HybridOptions {
@@ -315,6 +496,7 @@ impl Default for HybridOptions {
             intent: None,
             term_match: TermMatch::default(),
             rerank_chunk: RerankChunk::default(),
+            explain: false,
         }
     }
 }
@@ -392,6 +574,8 @@ pub struct HybridResult {
     pub rerank_score: Option<f64>,
     pub context: Option<String>,
     pub docid: String,
+    /// Set when [`HybridOptions::explain`] asked for it.
+    pub explain: Option<Explain>,
 }
 
 /// What the pipeline did, for CLI progress/debug output.
@@ -452,9 +636,16 @@ pub fn hybrid_query(
 
     let mut lists: Vec<Vec<SearchResult>> = Vec::new();
     let mut weights: Vec<f64> = Vec::new();
+    let mut sources: Vec<ListSource> = Vec::new();
+    let original = |backend| ListSource {
+        backend,
+        kind: "original",
+        query: query.to_owned(),
+    };
     if !initial_fts.is_empty() {
         lists.push(initial_fts);
         weights.push(2.0);
+        sources.push(original(Backend::Fts));
     }
 
     let mut query_embedding = None;
@@ -468,6 +659,7 @@ pub fn hybrid_query(
                 if !vec_results.is_empty() {
                     lists.push(vec_results);
                     weights.push(2.0);
+                    sources.push(original(Backend::Vec));
                 }
                 query_embedding = Some(embedding);
             }
@@ -478,12 +670,15 @@ pub fn hybrid_query(
 
     report.lists_fused = lists.len();
     let fused = reciprocal_rank_fusion(&lists, &weights, RRF_K);
+    let traces = options
+        .explain
+        .then(|| rrf_traces(&lists, &weights, &sources, RRF_K));
     let rerank = reranker.map(|r| RerankInput {
         reranker: r,
         query,
         embedding: query_embedding.as_deref(),
     });
-    let results = finalize_candidates(store, fused, query, rerank, options, &mut report)?;
+    let results = finalize_candidates(store, fused, traces, query, rerank, options, &mut report)?;
     Ok(HybridResponse { results, report })
 }
 
@@ -524,6 +719,12 @@ pub fn structured_search(
 
     let collections = &options.collections;
     let mut lists: Vec<Vec<SearchResult>> = Vec::new();
+    let mut sources: Vec<ListSource> = Vec::new();
+    let typed = |backend, search: &TypedQuery| ListSource {
+        backend,
+        kind: search.query_type.as_str(),
+        query: search.query.clone(),
+    };
 
     for search in searches {
         if search.query_type == QueryType::Lex {
@@ -532,6 +733,7 @@ pub fn structured_search(
             })?;
             if !fts_results.is_empty() {
                 lists.push(fts_results);
+                sources.push(typed(Backend::Fts, search));
             }
         }
     }
@@ -549,11 +751,13 @@ pub fn structured_search(
                 .collect();
             report.queries_embedded = texts.len();
             let mut embeddings = embedder.embed_batch(&texts)?;
-            for embedding in embeddings.iter().flatten() {
+            for (search, embedding) in vec_searches.iter().zip(&embeddings) {
+                let Some(embedding) = embedding else { continue };
                 let vec_results =
                     ranked_list(collections, |k, c| store.search_vec(embedding, k, c))?;
                 if !vec_results.is_empty() {
                     lists.push(vec_results);
+                    sources.push(typed(Backend::Vec, search));
                 }
             }
             let first_vec = vec_searches
@@ -571,6 +775,9 @@ pub fn structured_search(
         .collect();
     report.lists_fused = lists.len();
     let fused = reciprocal_rank_fusion(&lists, &weights, RRF_K);
+    let traces = options
+        .explain
+        .then(|| rrf_traces(&lists, &weights, &sources, RRF_K));
 
     let primary_query = searches
         .iter()
@@ -589,7 +796,15 @@ pub fn structured_search(
         query: rerank_query,
         embedding: rerank_embedding.as_deref(),
     });
-    let results = finalize_candidates(store, fused, &primary_query, rerank, options, &mut report)?;
+    let results = finalize_candidates(
+        store,
+        fused,
+        traces,
+        &primary_query,
+        rerank,
+        options,
+        &mut report,
+    )?;
     Ok(HybridResponse { results, report })
 }
 
@@ -607,10 +822,12 @@ struct RerankInput<'a> {
 /// keyword overlap (intent terms at [`INTENT_WEIGHT_CHUNK`]), score — `1/rrf_rank`, or
 /// with a reranker the [`blend`] of that rank and the best rerank score among
 /// the [`RerankChunk`] chunks, reordered — then filter by `min_score` and
-/// slice to `limit`. Fused results are already unique per file.
+/// slice to `limit`. Fused results are already unique per file. `traces`,
+/// when given, are completed and attached to the results they describe.
 fn finalize_candidates(
     store: &Store,
     fused: Vec<SearchResult>,
+    mut traces: Option<HashMap<String, Explain>>,
     primary_query: &str,
     rerank: Option<RerankInput<'_>>,
     options: &HybridOptions,
@@ -700,7 +917,17 @@ fn finalize_candidates(
             rerank_chunks.push(offered);
         }
 
+        let explain = traces
+            .as_mut()
+            .and_then(|t| t.remove(&cand.filepath))
+            .map(|mut trace| {
+                trace.rrf_rank = i + 1;
+                trace.position_score = 1.0 / (i as f64 + 1.0);
+                trace.final_score = trace.position_score;
+                trace
+            });
         results.push(HybridResult {
+            explain,
             context: None,
             filepath: cand.filepath,
             display_path: cand.display_path,
@@ -739,6 +966,13 @@ fn finalize_candidates(
             result.best_chunk_pos = chunk.pos;
             result.rerank_score = Some(rerank_score);
             result.score = blend(i + 1, rerank_score);
+            if let Some(trace) = &mut result.explain {
+                trace.rerank = Some(RerankTrace {
+                    rerank_score,
+                    fused_weight: blend_fused_weight(i + 1),
+                });
+                trace.final_score = result.score;
+            }
         }
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.retain(|r| r.score >= options.min_score);
@@ -854,6 +1088,50 @@ mod tests {
         assert!((a.score - (2.0 / 61.0 + 1.0 / 62.0 + 0.05)).abs() < 1e-12);
         assert!((b.score - (2.0 / 62.0 + 1.0 / 61.0 + 0.05)).abs() < 1e-12);
         assert_eq!(fused[0].display_path, "c/a", "higher-weighted rank wins");
+    }
+
+    #[test]
+    fn rrf_traces_reproduce_the_fused_scores_exactly() {
+        let lists = vec![
+            vec![ranked("a", 0.9), ranked("b", 0.5), ranked("c", 0.4)],
+            vec![ranked("c", 0.8), ranked("d", 0.7), ranked("e", 0.6)],
+            vec![
+                ranked("e", 0.3),
+                ranked("f", 0.2),
+                ranked("g", 0.1),
+                ranked("a", 0.05),
+                ranked("h", 0.01),
+            ],
+        ];
+        let weights = [2.0, 2.0, 1.0];
+        let sources: Vec<ListSource> = [Backend::Fts, Backend::Vec, Backend::Vec]
+            .into_iter()
+            .map(|backend| ListSource {
+                backend,
+                kind: "original",
+                query: "q".to_owned(),
+            })
+            .collect();
+        let fused = reciprocal_rank_fusion(&lists, &weights, RRF_K);
+        let traces = rrf_traces(&lists, &weights, &sources, RRF_K);
+        assert_eq!(traces.len(), fused.len());
+        for r in &fused {
+            let trace = &traces[&r.filepath];
+            assert_eq!(
+                trace.rrf_score.to_bits(),
+                r.score.to_bits(),
+                "{}",
+                r.filepath
+            );
+        }
+        let a = &traces["qmd://c/a"];
+        assert_eq!(a.contributions.len(), 2);
+        assert_eq!(a.contributions[1].rank, 4);
+        assert_eq!(a.contributions[1].backend_score, 0.05);
+        assert_eq!(a.rrf_bonus, 0.05);
+        assert_eq!(traces["qmd://c/d"].rrf_bonus, 0.02);
+        assert_eq!(traces["qmd://c/g"].rrf_bonus, 0.02);
+        assert_eq!(traces["qmd://c/h"].rrf_bonus, 0.0);
     }
 
     #[test]

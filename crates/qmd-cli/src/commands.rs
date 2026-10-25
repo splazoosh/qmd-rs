@@ -386,6 +386,185 @@ pub fn collection_remove(location: &IndexLocation, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_collection(app: &App, name: &str) -> Result<()> {
+    if app.config.get(name).is_none() {
+        bail!("collection not found: {name} (run 'qmd collection list')");
+    }
+    Ok(())
+}
+
+pub fn collection_rename(location: &IndexLocation, old: &str, new: &str) -> Result<()> {
+    let mut app = open(location)?;
+    require_collection(&app, old)?;
+    if !config::is_valid_collection_name(new) {
+        bail!("invalid collection name '{new}' (use letters, numbers, hyphens, underscores)");
+    }
+    if app.config.get(new).is_some() {
+        bail!("collection '{new}' already exists; choose another name or remove it first");
+    }
+    let moved = app.store.rename_collection(old, new)?;
+    app.config.rename_collection(old, new);
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!("✓ Renamed collection '{old}' to '{new}' ({moved} documents)");
+    println!("  Virtual paths: qmd://{old}/ → qmd://{new}/");
+    Ok(())
+}
+
+pub fn collection_show(location: &IndexLocation, name: &str) -> Result<()> {
+    let app = open(location)?;
+    require_collection(&app, name)?;
+    let coll = &app.config.collections[name];
+    let stats = app
+        .store
+        .list_collections_with_stats()?
+        .into_iter()
+        .find(|s| s.name == name);
+    let params = coll.chunk_params();
+    println!("Collection: {name}");
+    println!("  Path:     {}", coll.path);
+    println!("  Pattern:  {}", coll.pattern);
+    if let Some(ignore) = coll.ignore.as_ref().filter(|i| !i.is_empty()) {
+        println!("  Ignore:   {}", ignore.join(", "));
+    }
+    println!(
+        "  Include:  {}",
+        if coll.is_included_by_default() {
+            "yes (default)"
+        } else {
+            "no"
+        }
+    );
+    if let Some(update) = &coll.update {
+        println!("  Update:   {update}");
+    }
+    if let Some(context) = &coll.context {
+        println!("  Contexts: {}", context.len());
+    }
+    println!(
+        "  Chunks:   {} tokens, {} boundary",
+        params.size_tokens,
+        coll.chunk_boundary.unwrap_or_default().as_str()
+    );
+    if let Some(stats) = stats {
+        println!("  Files:    {}", stats.active_count);
+        if let Some(modified) = &stats.last_modified {
+            println!("  Updated:  {modified}");
+        }
+    }
+    Ok(())
+}
+
+pub fn collection_update_cmd(location: &IndexLocation, name: &str, command: &str) -> Result<()> {
+    let mut app = open(location)?;
+    require_collection(&app, name)?;
+    let command = command.trim();
+    let coll = app.config.collections.get_mut(name).expect("checked above");
+    coll.update = (!command.is_empty()).then(|| command.to_owned());
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    if command.is_empty() {
+        println!("✓ Cleared update command for '{name}'");
+    } else {
+        println!("✓ Set update command for '{name}': {command}");
+    }
+    Ok(())
+}
+
+pub fn collection_include(location: &IndexLocation, name: &str, include: bool) -> Result<()> {
+    let mut app = open(location)?;
+    require_collection(&app, name)?;
+    app.config
+        .collections
+        .get_mut(name)
+        .expect("checked above")
+        .include_by_default = (!include).then_some(false);
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!(
+        "✓ Collection '{name}' {} default queries",
+        if include {
+            "included in"
+        } else {
+            "excluded from"
+        }
+    );
+    Ok(())
+}
+
+pub fn cleanup(location: &IndexLocation, dry_run: bool) -> Result<()> {
+    let app = if dry_run {
+        open_without_sync(location)?
+    } else {
+        open(location)?
+    };
+    let (stats, verb) = if dry_run {
+        println!("Dry run — no changes made.\n");
+        (app.store.preview_cleanup()?, "Would remove")
+    } else {
+        (app.store.cleanup()?, "Removed")
+    };
+    println!("{verb} {} cached rerank scores", stats.cached_scores);
+    println!(
+        "{verb} {} orphaned embedding chunks",
+        stats.orphaned_vectors
+    );
+    println!("{verb} {} inactive document records", stats.inactive_docs);
+    println!("{verb} {} orphaned content hashes", stats.orphaned_content);
+    if dry_run {
+        println!("Would compact FTS and vacuum the database");
+    } else {
+        println!("✓ FTS compacted, database vacuumed");
+    }
+    Ok(())
+}
+
+/// Run a collection's `update` command in its root before it is indexed, as
+/// TS qmd does; a failure stops `qmd update` with the command's status.
+/// Commands from a project-local config run only with
+/// `QMD_TRUST_LOCAL_CONFIG=1`, since such a config can arrive with a checkout.
+fn run_update_command(location: &IndexLocation, root: &Path, command: &str) -> Result<()> {
+    let c = colors();
+    if matches!(location, IndexLocation::Local(_))
+        && std::env::var("QMD_TRUST_LOCAL_CONFIG").as_deref() != Ok("1")
+    {
+        println!(
+            "{}Skipped update command (project-local config; set QMD_TRUST_LOCAL_CONFIG=1 to run it): {command}{}",
+            c.yellow, c.reset
+        );
+        return Ok(());
+    }
+    println!("{}    Running update command: {command}{}", c.dim, c.reset);
+    let mut shell = if cfg!(windows) {
+        let mut shell = std::process::Command::new("cmd");
+        shell.arg("/C").arg(command);
+        shell
+    } else {
+        let mut shell = std::process::Command::new("sh");
+        shell.arg("-c").arg(command);
+        shell
+    };
+    let output = shell
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("failed to start update command: {command}"))?;
+    for stream in [&output.stdout, &output.stderr] {
+        for line in String::from_utf8_lossy(stream).trim().lines() {
+            println!("    {line}");
+        }
+    }
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(1);
+        return Err(crate::Exit {
+            code,
+            message: format!("update command failed with exit code {code}: {command}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub fn update(location: &IndexLocation) -> Result<()> {
     let app = open(location)?;
     let collections = app.config.list();
@@ -423,6 +602,9 @@ pub fn update(location: &IndexLocation) -> Result<()> {
             );
             skipped.push(named.name.as_str());
             continue;
+        }
+        if let Some(command) = &named.collection.update {
+            run_update_command(location, root, command)?;
         }
         let ignore = named.collection.ignore.clone().unwrap_or_default();
         let result = reindex_collection(
@@ -741,6 +923,7 @@ pub fn query(
     query: &str,
     intent: Option<&str>,
     rerank: Option<bool>,
+    explain: bool,
     opts: &SearchOptions,
 ) -> Result<()> {
     use qmd::query::{
@@ -788,6 +971,7 @@ pub fn query(
         min_score: opts.min_score.unwrap_or(0.0),
         intent: intent.clone(),
         term_match: opts.term_match.or(settings.term_match).unwrap_or_default(),
+        explain,
         ..Default::default()
     };
 

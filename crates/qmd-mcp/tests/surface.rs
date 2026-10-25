@@ -186,6 +186,61 @@ async fn query_takes_match_and_rerank() {
 }
 
 #[tokio::test]
+async fn query_returns_the_explain_trace_when_asked() {
+    let fixture = Fixture::build();
+    let (client, _) = connect(&fixture).await;
+
+    let plain = call(&client, "query", json!({ "query": "raft leader election" })).await;
+    let plain_rows = plain
+        .structured_content
+        .clone()
+        .expect("structured content");
+    assert!(plain_rows["results"][0].get("explain").is_none());
+    assert!(!text_of(&plain).contains("Explain:"));
+
+    for rerank in [false, true] {
+        let explained = call(
+            &client,
+            "query",
+            json!({ "query": "raft leader election", "explain": true, "rerank": rerank }),
+        )
+        .await;
+        assert_ne!(explained.is_error, Some(true), "{}", text_of(&explained));
+        let rows = explained
+            .structured_content
+            .clone()
+            .expect("structured content");
+        let top = &rows["results"][0];
+        assert_eq!(top["file"], "notes/raft.md");
+        assert_eq!(top["explain"]["rrf_rank"], 1);
+        assert!(
+            top["explain"]["contributions"][0]["rank"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(top["explain"]["rerank"].is_null(), !rerank, "{top}");
+        assert!(text_of(&explained).contains("Explain:"));
+        if !rerank {
+            let files = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+                v["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["file"].clone())
+                    .collect()
+            };
+            assert_eq!(
+                files(&rows),
+                files(&plain_rows),
+                "explain changes no ranking"
+            );
+        }
+    }
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn query_rejects_both_arms_at_once_as_a_tool_error() {
     let fixture = Fixture::build();
     let (client, _) = connect(&fixture).await;

@@ -285,6 +285,17 @@ impl CollectionConfig {
     pub fn remove_collection(&mut self, name: &str) -> bool {
         self.collections.shift_remove(name).is_some()
     }
+
+    /// Rename a collection in place, keeping its position in the file.
+    /// Returns false if `old` did not exist.
+    pub fn rename_collection(&mut self, old: &str, new: &str) -> bool {
+        let Some((index, _, collection)) = self.collections.shift_remove_full(old) else {
+            return false;
+        };
+        self.collections
+            .shift_insert(index, new.to_owned(), collection);
+        true
+    }
 }
 
 /// Validate a collection name: alphanumeric, hyphens, underscores.
@@ -389,6 +400,20 @@ collections:
         assert_eq!(a.path, "/tmp/b");
         assert_eq!(a.context, Some(ctx));
         assert_eq!(a.ignore.as_deref(), Some(&["x/**".to_owned()][..]));
+    }
+
+    #[test]
+    fn rename_collection_keeps_its_place_and_settings() {
+        let mut config = CollectionConfig::default();
+        config.add_collection("a", "/a", "**/*.md", &[]);
+        config.add_collection("b", "/b", "**/*.md", &[]);
+        config.add_collection("c", "/c", "**/*.md", &[]);
+        config.collections.get_mut("b").unwrap().update = Some("git pull".to_owned());
+        assert!(config.rename_collection("b", "z"));
+        assert!(!config.rename_collection("missing", "y"));
+        let names: Vec<&str> = config.collections.keys().map(String::as_str).collect();
+        assert_eq!(names, ["a", "z", "c"]);
+        assert_eq!(config.get("z").unwrap().update.as_deref(), Some("git pull"));
     }
 
     #[test]

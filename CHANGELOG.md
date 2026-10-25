@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+- `query --explain` shows how each result got its rank: its rank, weight,
+  score and RRF share in each BM25 and vector list, the fused score and rank,
+  and the final score, with the rerank blend when `--rerank` ran. `cli` format
+  prints it under each result, `json` adds an `explain` object; the MCP
+  `query` tool and `POST /query` take `explain: true`. It changes no ranking
+  or score.
+- New collection commands: `collection rename <old> <new>` (no re-index, no
+  re-embed), `collection show <name>`, `collection update-cmd <name> [cmd]`,
+  `collection include <name>` and `collection exclude <name>`.
+- `qmd update` runs each collection's `update` command in its directory before
+  indexing it, through `sh -c` (`cmd /C` on Windows); a failing command stops
+  the update with its status. Under a project-local `.qmd` config it runs only
+  with `QMD_TRUST_LOCAL_CONFIG=1`.
+- `qmd cleanup [--dry-run]` clears cached rerank scores, deletes vectors no
+  active document uses, inactive document rows and unreferenced content, then
+  compacts FTS and vacuums. Nothing needs re-embedding afterwards.
+- `collection show` and `cleanup --dry-run` are read-only commands for the
+  closed-stdout exit status of 0.2.2.
+
 ## 0.2.2
 
 - **Narrows 0.2.1:** when the reader of its output goes away, `qmd` exits with

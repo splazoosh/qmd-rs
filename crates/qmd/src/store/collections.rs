@@ -286,6 +286,31 @@ impl Store {
         Ok((deleted, cleaned))
     }
 
+    /// Rename a collection in the database: its documents (their FTS rows
+    /// follow by trigger), its mirror row and its chunk settings. Vectors are
+    /// keyed by content hash, so they stay; a hash also held by another
+    /// collection may change home and re-embed if the two chunk differently.
+    /// Returns the number of documents moved.
+    pub fn rename_collection(&self, old: &str, new: &str) -> Result<usize> {
+        let tx = self.conn().unchecked_transaction()?;
+        let moved = tx.execute(
+            "UPDATE documents SET collection = ?2 WHERE collection = ?1",
+            params![old, new],
+        )?;
+        tx.execute(
+            "UPDATE store_collections SET name = ?2 WHERE name = ?1",
+            params![old, new],
+        )?;
+        for prefix in ["chunk_tokens", "chunk_boundary"] {
+            tx.execute(
+                "UPDATE store_config SET key = ?2 WHERE key = ?1",
+                params![format!("{prefix}:{old}"), format!("{prefix}:{new}")],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
     /// Context for a file: global context plus all matching path-prefix
     /// contexts (most general first), joined with blank lines.
     pub fn context_for_file(&self, filepath: &str) -> Result<Option<String>> {
@@ -388,5 +413,30 @@ mod tests {
         store.upsert_store_collection("n", &collection).unwrap();
         store.remove_collection("n").unwrap();
         assert!(store.collection_chunk_params("n").unwrap().is_default());
+    }
+
+    #[test]
+    fn renaming_a_collection_moves_its_documents_and_settings() {
+        let store = Store::open_in_memory().unwrap();
+        let mut collection = Collection::new("/n", "**/*.md");
+        collection.chunk_tokens = Some(300);
+        store.upsert_store_collection("n", &collection).unwrap();
+        let params = store.collection_chunk_params("n").unwrap();
+        let hash = crate::store::hash_content("# Raft\n\nleader election");
+        store
+            .insert_content(&hash, "# Raft\n\nleader election", "2026-01-01")
+            .unwrap();
+        store
+            .insert_document("n", "raft.md", "Raft", &hash, "2026-01-01", "2026-01-01")
+            .unwrap();
+
+        assert_eq!(store.rename_collection("n", "m").unwrap(), 1);
+        assert!(store.store_collection("n").unwrap().is_none());
+        assert!(store.store_collection("m").unwrap().is_some());
+        assert_eq!(store.collection_chunk_params("m").unwrap(), params);
+        assert!(store.collection_chunk_params("n").unwrap().is_default());
+        let hits = store.search_fts("leader", 5, Some("m")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].filepath, "qmd://m/raft.md");
     }
 }

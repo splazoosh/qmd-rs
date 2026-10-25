@@ -239,6 +239,9 @@ pub fn status(location: &IndexLocation) -> Result<()> {
     };
     println!("\n{}Models{}", c.bold, c.reset);
     println!("  Embedding:   {}", hf_link(&model));
+    let hf = qmd::models::hf::HfSetup::from_env();
+    println!("  Download:    {}", hf.route());
+    println!("  HF token:    {}", hf.token_status());
 
     Ok(())
 }
@@ -249,6 +252,8 @@ pub fn collection_add(
     name: Option<&str>,
     mask: &str,
     ignore: &[String],
+    chunk_tokens: Option<usize>,
+    chunk_boundary: Option<qmd::chunk::ChunkBoundary>,
 ) -> Result<()> {
     let resolved =
         std::fs::canonicalize(path).with_context(|| format!("directory not found: {path}"))?;
@@ -288,6 +293,22 @@ pub fn collection_add(
 
     app.config
         .add_collection(&coll_name, &resolved_str, mask, ignore);
+    if let Some(tokens) = chunk_tokens {
+        let clamped = qmd::chunk::ChunkParams::for_size(tokens).size_tokens;
+        if clamped != tokens {
+            bail!(
+                "--chunk-tokens must be {} to {}",
+                qmd::chunk::MIN_CHUNK_TOKENS,
+                qmd::chunk::MAX_CHUNK_TOKENS
+            );
+        }
+        if let Some(c) = app.config.collections.get_mut(&coll_name) {
+            c.chunk_tokens = Some(tokens);
+        }
+    }
+    if let Some(c) = app.config.collections.get_mut(&coll_name) {
+        c.chunk_boundary = chunk_boundary;
+    }
     config::save_config(&app.config_path, &app.config)?;
     app.store.sync_config_to_db(&app.config)?;
 
@@ -552,9 +573,13 @@ pub fn search(location: &IndexLocation, query: &str, opts: &SearchOptions) -> Re
     let limit = if opts.all { 100_000 } else { limit };
     let fetch_limit = if opts.all { 100_000 } else { limit.max(50) * 2 };
 
-    let mut results = app
-        .store
-        .search_fts(query, fetch_limit, single_collection.as_deref())?;
+    let term_match = opts
+        .term_match
+        .or(app.config.search_settings().term_match)
+        .unwrap_or_default();
+    let mut results =
+        app.store
+            .search_fts_with(query, fetch_limit, single_collection.as_deref(), term_match)?;
     retain_collections(&mut results, &collection_names, |r| &r.filepath);
 
     let min_score = opts.min_score.unwrap_or(0.0);
@@ -608,6 +633,28 @@ fn load_embedder(model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
         )
     })?;
     Ok(Box::new(embedder))
+}
+
+/// Load the reranker for a model URI. `QMD_MOCK_EMBEDDER` selects the mock
+/// reranker too, so the test seam needs no model.
+fn load_reranker(model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
+    if mock_embedder_requested() {
+        return Ok(Box::new(qmd::rerank::MockReranker));
+    }
+    load_llama_reranker(model)
+}
+
+#[cfg(feature = "llama")]
+fn load_llama_reranker(model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
+    let reranker = qmd::rerank::LlamaReranker::load(model).with_context(|| {
+        format!("failed to load rerank model {model} — run 'qmd pull' to (re)download it")
+    })?;
+    Ok(Box::new(reranker))
+}
+
+#[cfg(not(feature = "llama"))]
+fn load_llama_reranker(_model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
+    bail!("this build has no model backend: rebuild qmd-cli with its default features to rerank")
 }
 
 /// Where `load_embedder` will run: `Some(true)` GPU, `Some(false)` CPU, `None`
@@ -693,6 +740,7 @@ pub fn query(
     location: &IndexLocation,
     query: &str,
     intent: Option<&str>,
+    rerank: Option<bool>,
     opts: &SearchOptions,
 ) -> Result<()> {
     use qmd::query::{
@@ -721,6 +769,14 @@ pub fn query(
             None
         };
     let embedder_dyn = embedder.as_deref().map(|e| e as &dyn qmd::embed::Embedder);
+    let settings = app.config.search_settings();
+    let reranker = if rerank.or(settings.rerank).unwrap_or(false) {
+        Some(load_reranker(&qmd::models::resolve_rerank_model(
+            app.config.models.as_ref(),
+        ))?)
+    } else {
+        None
+    };
 
     let options = HybridOptions {
         collections: collection_names,
@@ -731,6 +787,7 @@ pub fn query(
         },
         min_score: opts.min_score.unwrap_or(0.0),
         intent: intent.clone(),
+        term_match: opts.term_match.or(settings.term_match).unwrap_or_default(),
         ..Default::default()
     };
 
@@ -777,11 +834,24 @@ pub fn query(
                     .find(|s| s.query_type == QueryType::Vec)
             })
             .map_or_else(|| query.to_owned(), |s| s.query.clone());
-        structured_search(&app.store, embedder_dyn, &parsed.searches, &options)
-            .map_err(|e| anyhow!("{e}"))?
+        structured_search(
+            &app.store,
+            embedder_dyn,
+            reranker.as_deref(),
+            &parsed.searches,
+            &options,
+        )
+        .map_err(|e| anyhow!("{e}"))?
     } else {
         display_query = query.to_owned();
-        hybrid_query(&app.store, embedder_dyn, query, &options).map_err(|e| anyhow!("{e}"))?
+        hybrid_query(
+            &app.store,
+            embedder_dyn,
+            reranker.as_deref(),
+            query,
+            &options,
+        )
+        .map_err(|e| anyhow!("{e}"))?
     };
 
     if let Some(score) = response.report.strong_signal {
@@ -789,6 +859,12 @@ pub fn query(
             "{}Strong BM25 signal ({score:.2}) — expansion bypass (expansion is not \
              implemented yet){}",
             c.dim, c.reset
+        );
+    }
+    if response.report.reranked > 0 {
+        eprintln!(
+            "{}Reranked {} candidates ({} by the model, the rest cached){}",
+            c.dim, response.report.reranked, response.report.rerank_fresh, c.reset
         );
     }
     if response.report.vector_skipped {
@@ -872,15 +948,28 @@ pub fn embed(location: &IndexLocation, force: bool, collection: Option<&str>) ->
 
 pub fn pull(location: &IndexLocation, refresh: bool) -> Result<()> {
     let config = config::load_config(&location.config_path())?;
-    let model = embed_model(&config);
+    let mut models = vec![embed_model(&config)];
+    if config.search_settings().rerank == Some(true) {
+        models.push(qmd::models::resolve_rerank_model(config.models.as_ref()));
+    }
     let c = colors();
     println!("{}Pulling models{}", c.bold, c.reset);
     let cache_dir = qmd::models::model_cache_dir();
-    let result = qmd::models::pull_model(&model, &cache_dir, refresh)?;
-    let note = if result.refreshed {
-        "refreshed"
-    } else {
-        "cached/checked"
+    for model in &models {
+        pull_one(model, &cache_dir, refresh)?;
+    }
+    Ok(())
+}
+
+fn pull_one(model: &str, cache_dir: &Path, refresh: bool) -> Result<()> {
+    let result = qmd::models::pull_model(model, cache_dir, refresh)?;
+    if let Some(failure) = &result.cli_failure {
+        eprintln!("{failure}; used the built-in download instead");
+    }
+    let note = match (&result.route, result.refreshed) {
+        (None, _) => "cached/checked".to_owned(),
+        (Some(route), true) => format!("refreshed by {route}"),
+        (Some(route), false) => format!("fetched by {route}"),
     };
     println!(
         "- {} -> {} ({}, {note})",
@@ -967,6 +1056,14 @@ fn parse_line_suffix(input: &str) -> Option<(String, usize, Option<usize>)> {
     Some((rest.to_owned(), line, None))
 }
 
+/// The model loaders the MCP index thread calls on first use.
+fn factories() -> qmd_mcp::Factories {
+    qmd_mcp::Factories {
+        embedder: Box::new(load_embedder),
+        reranker: Box::new(load_reranker),
+    }
+}
+
 /// `qmd mcp`: serve the active index over MCP on stdin/stdout, or with
 /// `http_port` over HTTP on that loopback port until interrupted.
 ///
@@ -987,14 +1084,14 @@ pub fn mcp(location: &IndexLocation, http_port: Option<u16>) -> Result<()> {
             &config_path,
             &db_path,
             model,
-            Box::new(load_embedder),
+            factories(),
         ));
     };
     let served = runtime.block_on(qmd_mcp::serve_http(
         &config_path,
         &db_path,
         model,
-        Box::new(load_embedder),
+        factories(),
         std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
         |addr| eprintln!("QMD MCP server listening on http://{addr}/mcp"),
         async {

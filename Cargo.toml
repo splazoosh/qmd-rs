@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/qmd-archive", "crates/qmd-cli", "crates/qmd-mcp", "crates/qmd"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -28,3 +28,9 @@ priority = -1
 [workspace.lints.clippy.perf]
 level = "warn"
 priority = -1
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

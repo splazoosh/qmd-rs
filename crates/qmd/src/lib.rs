@@ -3,8 +3,8 @@
 //!
 //! Surface: config parsing, store (schema/docs/FTS/vectors), indexing,
 //! chunking, embeddings, snippets, and the hybrid query pipeline (structured
-//! query parsing + RRF fusion). LLM query expansion and reranking are not
-//! implemented; [`query`] holds their seams.
+//! query parsing + RRF fusion, optional cross-encoder [`rerank`]). LLM query
+//! expansion is not implemented; [`query`] holds its seam.
 
 pub mod bench;
 pub mod chunk;
@@ -15,6 +15,7 @@ pub mod index;
 pub mod models;
 pub mod query;
 pub mod querylog;
+pub mod rerank;
 pub mod snippet;
 pub mod store;
 

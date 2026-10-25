@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::chunk::{ChunkBoundary, ChunkParams};
 use crate::error::{Error, Result};
+use crate::store::TermMatch;
 
 /// Context definitions for a collection: path prefix -> description.
 pub type ContextMap = IndexMap<String, String>;
@@ -38,6 +40,23 @@ pub struct Collection {
         skip_serializing_if = "Option::is_none"
     )]
     pub include_by_default: Option<bool>,
+    /// Chunk size in tokens for this collection's embeddings and best-chunk
+    /// selection (default 900). Changing it re-embeds the collection.
+    #[serde(
+        default,
+        rename = "chunkTokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chunk_tokens: Option<usize>,
+    /// Where chunks are cut: `window` (default, TS) or `heading`, which starts
+    /// a chunk at a heading with no overlap ([`ChunkBoundary`]). Changing it
+    /// re-embeds the collection.
+    #[serde(
+        default,
+        rename = "chunkBoundary",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chunk_boundary: Option<ChunkBoundary>,
 }
 
 pub fn default_pattern() -> String {
@@ -53,11 +72,20 @@ impl Collection {
             context: None,
             update: None,
             include_by_default: None,
+            chunk_tokens: None,
+            chunk_boundary: None,
         }
     }
 
     pub fn is_included_by_default(&self) -> bool {
         self.include_by_default != Some(false)
+    }
+
+    /// Chunk geometry for this collection.
+    pub fn chunk_params(&self) -> ChunkParams {
+        self.chunk_tokens
+            .map_or_else(ChunkParams::default, ChunkParams::for_size)
+            .with_boundary(self.chunk_boundary.unwrap_or_default())
     }
 }
 
@@ -72,6 +100,18 @@ pub struct ModelsConfig {
     pub rerank: Option<String>,
 }
 
+/// Search defaults (`search:` section of `index.yml`); a CLI flag or MCP
+/// argument overrides each one per query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchConfig {
+    /// How BM25 terms combine: `any` (default) or `all`.
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub term_match: Option<TermMatch>,
+    /// Rerank hybrid results with the cross-encoder (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<bool>,
+}
+
 /// The complete configuration file structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollectionConfig {
@@ -82,6 +122,9 @@ pub struct CollectionConfig {
     /// Model URI overrides (resolution order: config > env var > default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelsConfig>,
+    /// Search defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchConfig>,
 }
 
 /// A collection paired with its name.
@@ -177,6 +220,11 @@ pub fn save_config(path: &Path, config: &CollectionConfig) -> Result<()> {
 }
 
 impl CollectionConfig {
+    /// The `search:` section, empty when absent.
+    pub fn search_settings(&self) -> SearchConfig {
+        self.search.clone().unwrap_or_default()
+    }
+
     /// List all collections with their names.
     pub fn list(&self) -> Vec<NamedCollection> {
         self.collections
@@ -257,6 +305,24 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&config).unwrap();
         let parsed: CollectionConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn parses_search_section_and_chunk_size() {
+        let yaml = "search:\n  match: any\n  rerank: true\ncollections:\n  notes:\n    path: /n\n    chunkTokens: 300\n    chunkBoundary: heading\n  docs:\n    path: /d\n";
+        let config: CollectionConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let search = config.search_settings();
+        assert_eq!(search.term_match, Some(TermMatch::Any));
+        assert_eq!(search.rerank, Some(true));
+        assert_eq!(
+            config.get("notes").unwrap().chunk_params(),
+            ChunkParams::for_size(300).with_boundary(ChunkBoundary::Heading)
+        );
+        assert!(config.get("docs").unwrap().chunk_params().is_default());
+        assert_eq!(
+            CollectionConfig::default().search_settings(),
+            SearchConfig::default()
+        );
     }
 
     #[test]

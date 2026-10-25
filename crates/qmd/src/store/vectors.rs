@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
-use crate::embed::embedding_fingerprint;
+use crate::chunk::ChunkParams;
+use crate::embed::embedding_fingerprint_for;
 use crate::error::{Error, Result};
 use crate::store::{SearchResult, Store};
 
@@ -19,6 +20,8 @@ pub struct PendingEmbeddingDoc {
     pub path: String,
     /// Body size in bytes (for batch budgeting).
     pub bytes: u64,
+    /// Chunk geometry of the collection that owns this hash.
+    pub chunk: ChunkParams,
 }
 
 /// Serialize an f32 vector to the little-endian blob layout sqlite-vec uses.
@@ -191,47 +194,95 @@ impl Store {
     }
 
     /// Documents (by unique content hash) that still need embeddings for the
-    /// given model + current fingerprint, ordered by path.
+    /// given model, ordered by path. Each hash is judged against the
+    /// fingerprint of its own chunk geometry: a hash held by several
+    /// collections is chunked as the first of them by name sets.
     pub fn pending_embedding_docs(
         &self,
         collection: Option<&str>,
         model: &str,
     ) -> Result<Vec<PendingEmbeddingDoc>> {
-        let fingerprint = embedding_fingerprint(model);
-        let collection_filter = if collection.is_some() {
-            "AND d.collection = ?3"
-        } else {
-            ""
+        let docs: Vec<(String, String, String, u64)> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT d.hash,
+                        MIN(CASE WHEN ?1 IS NULL OR d.collection = ?1 THEN d.path END) AS path,
+                        MIN(d.collection),
+                        length(CAST(c.doc AS BLOB))
+                 FROM documents d
+                 JOIN content c ON d.hash = c.hash
+                 WHERE d.active = 1
+                 GROUP BY d.hash
+                 HAVING path IS NOT NULL
+                 ORDER BY path",
+            )?;
+            let rows = stmt.query_map(params![collection], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)?.max(0).unsigned_abs(),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
         };
-        let sql = format!(
-            "SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
-             FROM documents d
-             JOIN content c ON d.hash = c.hash
-             LEFT JOIN (
-               SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
-               FROM content_vectors
-               WHERE model = ?1 AND embed_fingerprint = ?2
-               GROUP BY hash, model, embed_fingerprint
-             ) v ON d.hash = v.hash
-             WHERE d.active = 1
-               AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-               {collection_filter}
-             GROUP BY d.hash
-             ORDER BY MIN(d.path)"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<PendingEmbeddingDoc> {
-            Ok(PendingEmbeddingDoc {
-                hash: r.get(0)?,
-                path: r.get(1)?,
-                bytes: r.get::<_, i64>(2)?.max(0).unsigned_abs(),
-            })
+
+        let stored: HashMap<(String, String), (i64, i64)> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT hash, embed_fingerprint, COUNT(*), MAX(total_chunks)
+                 FROM content_vectors WHERE model = ?1
+                 GROUP BY hash, embed_fingerprint",
+            )?;
+            let rows = stmt.query_map(params![model], |r| {
+                Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?)))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
         };
-        let rows = match collection {
-            Some(c) => stmt.query_map(params![model, fingerprint, c], map_row)?,
-            None => stmt.query_map(params![model, fingerprint], map_row)?,
-        };
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+
+        let mut geometry: HashMap<String, (ChunkParams, String)> = HashMap::new();
+        let mut pending = Vec::new();
+        for (hash, path, home, bytes) in docs {
+            if !geometry.contains_key(&home) {
+                let chunk = self.collection_chunk_params(&home)?;
+                let fingerprint = embedding_fingerprint_for(model, &chunk);
+                geometry.insert(home.clone(), (chunk, fingerprint));
+            }
+            let (chunk, fingerprint) = &geometry[&home];
+            let complete = stored
+                .get(&(hash.clone(), fingerprint.clone()))
+                .is_some_and(|(count, expected)| count >= expected);
+            if !complete {
+                pending.push(PendingEmbeddingDoc {
+                    hash,
+                    path,
+                    bytes,
+                    chunk: *chunk,
+                });
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Delete every stored vector of one content hash, whatever model or
+    /// chunking produced it, so a re-embed leaves no chunk of the old set.
+    pub fn clear_hash_embeddings(&self, hash: &str) -> Result<()> {
+        if self.vec_table_exists()? {
+            let seqs: Vec<i64> = {
+                let mut stmt = self
+                    .conn()
+                    .prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
+                let rows = stmt.query_map(params![hash], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let mut del = self
+                .conn()
+                .prepare("DELETE FROM vectors_vec WHERE hash_seq = ?1")?;
+            for seq in seqs {
+                del.execute(params![format!("{hash}_{seq}")])?;
+            }
+        }
+        self.conn()
+            .execute("DELETE FROM content_vectors WHERE hash = ?1", params![hash])?;
+        Ok(())
     }
 
     /// Fetch document bodies for a set of content hashes.
@@ -330,6 +381,56 @@ impl Store {
             });
         }
         Ok(results)
+    }
+
+    /// The chunk geometry content `hash`'s vectors are cut with: its home
+    /// collection's, the first by name holding it, as
+    /// [`Self::pending_embedding_docs`] chooses.
+    pub fn vector_chunk_params(&self, hash: &str) -> Result<ChunkParams> {
+        let home: Option<String> = self.conn().query_row(
+            "SELECT MIN(collection) FROM documents WHERE hash = ?1 AND active = 1",
+            params![hash],
+            |r| r.get(0),
+        )?;
+        home.map_or_else(
+            || Ok(ChunkParams::default()),
+            |h| self.collection_chunk_params(&h),
+        )
+    }
+
+    /// Each embedded chunk of content `hash` as `(pos, cosine distance to
+    /// query_embedding)`, nearest first; empty when it has no vectors. One
+    /// vec0 point lookup per chunk, never a JOIN (see [`Self::search_vec`]).
+    pub fn chunk_distances(
+        &self,
+        hash: &str,
+        query_embedding: &[f32],
+    ) -> Result<Vec<(usize, f64)>> {
+        if !self.vec_table_exists()? {
+            return Ok(Vec::new());
+        }
+        let chunks: Vec<(i64, i64)> = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT seq, pos FROM content_vectors WHERE hash = ?1")?;
+            let rows = stmt.query_map(params![hash], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let blob = embedding_blob(query_embedding);
+        let mut stmt = self.conn().prepare(
+            "SELECT vec_distance_cosine(embedding, ?1) FROM vectors_vec WHERE hash_seq = ?2",
+        )?;
+        let mut distances = Vec::with_capacity(chunks.len());
+        for (seq, pos) in chunks {
+            let distance: Option<f64> = stmt
+                .query_row(params![blob, format!("{hash}_{seq}")], |r| r.get(0))
+                .optional()?;
+            if let (Some(distance), Ok(pos)) = (distance, usize::try_from(pos)) {
+                distances.push((pos, distance));
+            }
+        }
+        distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+        Ok(distances)
     }
 
     /// The two steps of [`Self::search_vec`] for one `k`: returns how many
@@ -433,6 +534,7 @@ type BestByFile = HashMap<String, (VecRow, f64)>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::embedding_fingerprint;
     use crate::store::hash_content;
 
     fn store_with_doc(collection: &str, path: &str, body: &str) -> (Store, String) {
@@ -494,6 +596,16 @@ mod tests {
 
         let none = store.search_vec(&unit(4, 0), 5, Some("missing")).unwrap();
         assert!(none.is_empty());
+
+        let distances = store.chunk_distances(&hash, &unit(4, 0)).unwrap();
+        assert_eq!(distances.iter().map(|d| d.0).collect::<Vec<_>>(), [10, 0]);
+        assert!(distances[0].1.abs() < 1e-5 && (distances[1].1 - 1.0).abs() < 1e-5);
+        assert!(
+            store
+                .chunk_distances("none", &unit(4, 0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -552,6 +664,20 @@ mod tests {
         );
 
         assert_eq!(store.pending_embedding_docs(None, "m2").unwrap().len(), 1);
+
+        let mut coll = crate::config::Collection::new("/c", "**/*.md");
+        coll.chunk_tokens = Some(300);
+        store.upsert_store_collection("c", &coll).unwrap();
+        let pending = store.pending_embedding_docs(None, model).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].chunk, ChunkParams::for_size(300));
+
+        store.clear_hash_embeddings(&hash).unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vectors_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

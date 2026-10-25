@@ -14,7 +14,9 @@ pub use docs::{
     DocumentLookup, DocumentResult, LsEntry, docid, extract_title, hash_content, is_docid,
     normalize_docid,
 };
-pub use fts::{SearchResult, build_fts5_query, sanitize_fts5_term};
+pub use fts::{
+    SearchResult, TermMatch, build_fts5_query, build_fts5_query_with, sanitize_fts5_term,
+};
 pub use vectors::PendingEmbeddingDoc;
 
 use std::path::{Path, PathBuf};

@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result};
 use qmd::config::{self, CollectionConfig};
 use qmd::embed::{Embedder, EmbeddingBackend};
+use qmd::rerank::Reranker;
 use qmd::store::Store;
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,6 +21,15 @@ use tokio::sync::{mpsc, oneshot};
 /// llama-backed one; tests supply a mock. Keeping it a callback keeps the
 /// `llama` feature (and its native build) off this crate entirely.
 pub type EmbedderFactory = Box<dyn Fn(&str) -> Result<Box<dyn EmbeddingBackend>> + Send + 'static>;
+
+/// Loads the reranker for a model URI, on first use.
+pub type RerankerFactory = Box<dyn Fn(&str) -> Result<Box<dyn Reranker>> + Send + 'static>;
+
+/// The model loaders the index thread calls lazily.
+pub struct Factories {
+    pub embedder: EmbedderFactory,
+    pub reranker: RerankerFactory,
+}
 
 /// The index, plus a lazily loaded embedder. Lives on the worker thread.
 pub struct Index {
@@ -32,7 +42,8 @@ pub struct Index {
     /// Modification time of `config_path` when `config` was read.
     config_mtime: Option<SystemTime>,
     embedder: Option<Box<dyn EmbeddingBackend>>,
-    factory: EmbedderFactory,
+    factories: Factories,
+    reranker: Option<(String, Box<dyn Reranker>)>,
 }
 
 impl Index {
@@ -44,7 +55,7 @@ impl Index {
         config_path: &Path,
         db_path: &Path,
         model: String,
-        factory: EmbedderFactory,
+        factories: Factories,
     ) -> Result<Self> {
         let config = config::load_config(config_path)?;
         let store = Store::open(db_path)
@@ -58,7 +69,8 @@ impl Index {
             model,
             config_mtime: modified(config_path),
             embedder: None,
-            factory,
+            factories,
+            reranker: None,
         })
     }
 
@@ -92,7 +104,7 @@ impl Index {
     /// Propagates model-load failures.
     pub fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some((self.factory)(&self.model)?);
+            self.embedder = Some((self.factories.embedder)(&self.model)?);
         }
         Ok(())
     }
@@ -100,6 +112,21 @@ impl Index {
     /// The loaded embedder, or `None` if [`Self::ensure_embedder`] has not run.
     pub fn embedder(&self) -> Option<&dyn Embedder> {
         self.embedder.as_deref().map(|e| e as &dyn Embedder)
+    }
+
+    /// The reranker for the config's rerank model, loaded on first use and
+    /// again when the config names another model.
+    pub fn ensure_reranker(&mut self) -> Result<()> {
+        let model = qmd::models::resolve_rerank_model(self.config.models.as_ref());
+        if self.reranker.as_ref().is_none_or(|(m, _)| *m != model) {
+            let reranker = (self.factories.reranker)(&model)?;
+            self.reranker = Some((model, reranker));
+        }
+        Ok(())
+    }
+
+    pub fn reranker(&self) -> Option<&dyn Reranker> {
+        self.reranker.as_ref().map(|(_, r)| r.as_ref())
     }
 }
 
@@ -128,7 +155,7 @@ impl Worker {
         config_path: &Path,
         db_path: &Path,
         model: String,
-        factory: EmbedderFactory,
+        factories: Factories,
     ) -> Result<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -137,7 +164,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("qmd-index".to_owned())
             .spawn(move || {
-                let mut index = match Index::open(&config_path, &db_path, model, factory) {
+                let mut index = match Index::open(&config_path, &db_path, model, factories) {
                     Ok(index) => {
                         let _ = ready_tx.send(Ok(()));
                         index

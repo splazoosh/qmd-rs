@@ -56,6 +56,8 @@ impl Fixture {
                 context: Some(context),
                 update: None,
                 include_by_default: Some(true),
+                chunk_tokens: None,
+                chunk_boundary: None,
             },
         );
         config.collections.insert(
@@ -67,6 +69,8 @@ impl Fixture {
                 context: None,
                 update: None,
                 include_by_default: Some(true),
+                chunk_tokens: None,
+                chunk_boundary: None,
             },
         );
 
@@ -95,7 +99,12 @@ impl Fixture {
             &self.config_path,
             &self.db_path,
             qmd::embed::Embedder::model_uri(&MockEmbedder::default()).to_owned(),
-            factory,
+            qmd_mcp::Factories {
+                embedder: factory,
+                reranker: Box::new(|_: &str| {
+                    Ok(Box::new(qmd::rerank::MockReranker) as Box<dyn qmd::rerank::Reranker>)
+                }),
+            },
         )
         .unwrap()
     }

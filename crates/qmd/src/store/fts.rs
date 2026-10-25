@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::store::Store;
@@ -85,12 +86,53 @@ fn sanitize_dotted_parts(term: &str) -> Vec<String> {
         .collect()
 }
 
+/// How the positive terms of a lex query combine. `Any` is the default;
+/// [`Store::search_fts`] keeps `All`, the TS behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TermMatch {
+    /// Every term must be present (FTS5 `AND`; the TS qmd behaviour).
+    All,
+    /// Any term may match (FTS5 `OR`); BM25 ranks documents holding more of
+    /// them higher.
+    #[default]
+    Any,
+}
+
+impl TermMatch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+        }
+    }
+}
+
+impl std::str::FromStr for TermMatch {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "all" | "and" => Ok(Self::All),
+            "any" | "or" => Ok(Self::Any),
+            other => Err(format!("unknown term match '{other}': use all or any")),
+        }
+    }
+}
+
+/// [`build_fts5_query_with`] in [`TermMatch::All`] mode.
+pub fn build_fts5_query(query: &str) -> Option<String> {
+    build_fts5_query_with(query, TermMatch::All)
+}
+
 /// Parse lex query syntax into an FTS5 MATCH expression.
 ///
 /// Supports quoted phrases (exact), `-term` negation, hyphenated compounds
 /// (phrase match), dotted versions (AND of parts), and plain terms (prefix
-/// match). Returns `None` when nothing searchable remains.
-pub fn build_fts5_query(query: &str) -> Option<String> {
+/// match). Positive items combine by `mode`; a phrase, compound or dotted
+/// version stays one item either way, and negations always exclude. Returns
+/// `None` when nothing searchable remains.
+pub fn build_fts5_query_with(query: &str, mode: TermMatch) -> Option<String> {
     let mut positive: Vec<String> = Vec::new();
     let mut negative: Vec<String> = Vec::new();
 
@@ -148,6 +190,8 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
                 if !parts.is_empty() {
                     if negated {
                         negative.push(format!("({})", parts.join(" AND ")));
+                    } else if mode == TermMatch::Any && parts.len() > 1 {
+                        positive.push(format!("({})", parts.join(" AND ")));
                     } else {
                         positive.extend(parts);
                     }
@@ -170,7 +214,13 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
         return None;
     }
 
-    let mut result = positive.join(" AND ");
+    let mut result = match mode {
+        TermMatch::All => positive.join(" AND "),
+        TermMatch::Any if positive.len() > 1 && !negative.is_empty() => {
+            format!("({})", positive.join(" OR "))
+        }
+        TermMatch::Any => positive.join(" OR "),
+    };
     for neg in negative {
         result = format!("{result} NOT {neg}");
     }
@@ -186,7 +236,18 @@ impl Store {
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let Some(fts_query) = build_fts5_query(query) else {
+        self.search_fts_with(query, limit, collection, TermMatch::All)
+    }
+
+    /// [`Store::search_fts`] with the terms combined by `mode`.
+    pub fn search_fts_with(
+        &self,
+        query: &str,
+        limit: usize,
+        collection: Option<&str>,
+        mode: TermMatch,
+    ) -> Result<Vec<SearchResult>> {
+        let Some(fts_query) = build_fts5_query_with(query, mode) else {
             return Ok(Vec::new());
         };
 
@@ -320,6 +381,36 @@ mod tests {
             build_fts5_query("\"foo _ bar\"").as_deref(),
             Some("\"foo bar\"")
         );
+    }
+
+    #[test]
+    fn any_mode_ors_items_and_keeps_groups_whole() {
+        let any = |q| build_fts5_query_with(q, TermMatch::Any);
+        assert_eq!(
+            any("hello world").as_deref(),
+            Some("\"hello\"* OR \"world\"*")
+        );
+        assert_eq!(
+            any("\"machine learning\" multi-agent 2026.4").as_deref(),
+            Some("\"machine learning\" OR \"multi agent\" OR (\"2026\"* AND \"4\"*)")
+        );
+        assert_eq!(
+            any("cache store -redis").as_deref(),
+            Some("(\"cache\"* OR \"store\"*) NOT \"redis\"*")
+        );
+        assert_eq!(
+            any("cache -redis").as_deref(),
+            Some("\"cache\"* NOT \"redis\"*")
+        );
+        assert_eq!(any("-redis"), None);
+    }
+
+    #[test]
+    fn term_match_parses_both_spellings() {
+        assert_eq!("any".parse::<TermMatch>(), Ok(TermMatch::Any));
+        assert_eq!("OR".parse::<TermMatch>(), Ok(TermMatch::Any));
+        assert_eq!("all".parse::<TermMatch>(), Ok(TermMatch::All));
+        assert!("some".parse::<TermMatch>().is_err());
     }
 
     #[test]

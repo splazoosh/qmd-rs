@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 /// fit, mirroring the TS context-size guard).
 const EMBED_CONTEXT_SIZE: u32 = 2048;
 
-fn backend() -> Result<&'static LlamaBackend> {
+pub(crate) fn backend() -> Result<&'static LlamaBackend> {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(backend) = BACKEND.get() {

@@ -9,6 +9,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -18,11 +19,99 @@ pub const CHUNK_SIZE_TOKENS: usize = 900;
 pub const CHUNK_OVERLAP_TOKENS: usize = CHUNK_SIZE_TOKENS * 15 / 100;
 /// Break-point search window before the target cut position.
 pub const CHUNK_WINDOW_TOKENS: usize = 200;
+/// Under [`ChunkBoundary::Heading`] a heading may be the cut anywhere after
+/// the first `1 / HEADING_SPAN_DIVISOR` of the chunk. Against the second
+/// half, a quarter held more sections whole; an eighth or any heading added
+/// almost nothing more for smaller chunks.
+pub const HEADING_SPAN_DIVISOR: usize = 4;
 
 /// Char approximations (~4 chars/token) used by the sync char-based chunker.
 pub const CHUNK_SIZE_CHARS: usize = CHUNK_SIZE_TOKENS * 4;
 pub const CHUNK_OVERLAP_CHARS: usize = CHUNK_OVERLAP_TOKENS * 4;
 pub const CHUNK_WINDOW_CHARS: usize = CHUNK_WINDOW_TOKENS * 4;
+
+/// Smallest and largest chunk size a collection may set. The ceiling keeps a
+/// chunk plus its embedding prompt inside the 2048-token embed context.
+pub const MIN_CHUNK_TOKENS: usize = 64;
+pub const MAX_CHUNK_TOKENS: usize = 1800;
+
+/// Chunk geometry in tokens. Everything follows from the size: overlap is
+/// 15% of it, and the break-point window is 200 tokens or half the size,
+/// whichever is smaller, so a cut can never fall in a chunk's first half.
+/// The default reproduces the TS constants (900/135/200, window boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkParams {
+    pub size_tokens: usize,
+    pub overlap_tokens: usize,
+    pub window_tokens: usize,
+    pub boundary: ChunkBoundary,
+}
+
+/// Where a chunk may end and the next begin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkBoundary {
+    /// The TS rule: the best-scoring break point in the window before the
+    /// target cut, and every next chunk starts `overlap` before it.
+    #[default]
+    Window,
+    /// A heading anywhere after the chunk's first quarter is the cut, and the next
+    /// chunk starts at that heading with no overlap; otherwise as `Window`.
+    Heading,
+}
+
+impl ChunkBoundary {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Heading => "heading",
+        }
+    }
+}
+
+impl std::str::FromStr for ChunkBoundary {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "window" => Ok(Self::Window),
+            "heading" => Ok(Self::Heading),
+            other => Err(format!(
+                "unknown chunk boundary '{other}': use window or heading"
+            )),
+        }
+    }
+}
+
+impl Default for ChunkParams {
+    fn default() -> Self {
+        Self::for_size(CHUNK_SIZE_TOKENS)
+    }
+}
+
+impl ChunkParams {
+    /// Geometry for a chunk size, clamped to
+    /// [`MIN_CHUNK_TOKENS`]..=[`MAX_CHUNK_TOKENS`].
+    pub fn for_size(size_tokens: usize) -> Self {
+        let size_tokens = size_tokens.clamp(MIN_CHUNK_TOKENS, MAX_CHUNK_TOKENS);
+        Self {
+            size_tokens,
+            overlap_tokens: size_tokens * 15 / 100,
+            window_tokens: CHUNK_WINDOW_TOKENS.min(size_tokens / 2),
+            boundary: ChunkBoundary::Window,
+        }
+    }
+
+    /// The same geometry with `boundary`.
+    #[must_use]
+    pub fn with_boundary(self, boundary: ChunkBoundary) -> Self {
+        Self { boundary, ..self }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 /// A potential break point with a base score (higher = better place to split).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +282,48 @@ pub fn find_best_cutoff(
     best_pos
 }
 
+/// The best heading cut in `(span_start, target_pos]`, scored as
+/// [`find_best_cutoff`] scores, with that span as the window; `None` when
+/// the span holds no heading outside a code fence.
+fn find_heading_cutoff(
+    break_points: &[BreakPoint],
+    span_start: usize,
+    target_pos: usize,
+    code_fences: &[CodeFenceRegion],
+) -> Option<usize> {
+    let span = target_pos.saturating_sub(span_start).max(1);
+    let mut best: Option<(f64, usize)> = None;
+    for bp in break_points {
+        if bp.pos <= span_start || !is_heading(bp) {
+            continue;
+        }
+        if bp.pos > target_pos {
+            break;
+        }
+        if is_inside_code_fence(bp.pos, code_fences) {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let normalized_dist = (target_pos - bp.pos) as f64 / span as f64;
+        let score = f64::from(bp.score) * (1.0 - normalized_dist * normalized_dist * 0.7);
+        if best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, bp.pos));
+        }
+    }
+    best.map(|(_, pos)| pos)
+}
+
+fn is_heading(bp: &BreakPoint) -> bool {
+    matches!(bp.kind, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+/// Whether the break point at `pos` is a heading.
+fn heading_at(break_points: &[BreakPoint], pos: usize) -> bool {
+    break_points
+        .binary_search_by_key(&pos, |bp| bp.pos)
+        .is_ok_and(|i| is_heading(&break_points[i]))
+}
+
 /// Largest char boundary `<= pos`.
 fn floor_char_boundary(s: &str, mut pos: usize) -> usize {
     pos = pos.min(s.len());
@@ -219,6 +350,7 @@ pub fn chunk_document_with_break_points(
     max_chars: usize,
     overlap_chars: usize,
     window_chars: usize,
+    boundary: ChunkBoundary,
 ) -> Vec<Chunk> {
     if content.len() <= max_chars {
         return vec![Chunk {
@@ -235,7 +367,18 @@ pub fn chunk_document_with_break_points(
         let mut end_pos = target_end;
 
         if end_pos < content.len() {
-            let best = find_best_cutoff(break_points, target_end, window_chars, 0.7, code_fences);
+            let heading = match boundary {
+                ChunkBoundary::Window => None,
+                ChunkBoundary::Heading => find_heading_cutoff(
+                    break_points,
+                    char_pos + (target_end - char_pos) / HEADING_SPAN_DIVISOR,
+                    target_end,
+                    code_fences,
+                ),
+            };
+            let best = heading.unwrap_or_else(|| {
+                find_best_cutoff(break_points, target_end, window_chars, 0.7, code_fences)
+            });
             if best > char_pos && best <= target_end {
                 end_pos = best;
             }
@@ -252,6 +395,13 @@ pub fn chunk_document_with_break_points(
 
         if end_pos >= content.len() {
             break;
+        }
+        if boundary == ChunkBoundary::Heading
+            && heading_at(break_points, end_pos)
+            && !is_inside_code_fence(end_pos, code_fences)
+        {
+            char_pos = end_pos + 1;
+            continue;
         }
         char_pos = floor_char_boundary(content, end_pos.saturating_sub(overlap_chars));
         let last_chunk_pos = chunks.last().expect("just pushed").pos;
@@ -270,6 +420,23 @@ pub fn chunk_document(
     overlap_chars: usize,
     window_chars: usize,
 ) -> Vec<Chunk> {
+    chunk_document_bounded(
+        content,
+        max_chars,
+        overlap_chars,
+        window_chars,
+        ChunkBoundary::Window,
+    )
+}
+
+/// [`chunk_document`] under a [`ChunkBoundary`] rule.
+pub fn chunk_document_bounded(
+    content: &str,
+    max_chars: usize,
+    overlap_chars: usize,
+    window_chars: usize,
+    boundary: ChunkBoundary,
+) -> Vec<Chunk> {
     let break_points = scan_break_points(content);
     let code_fences = find_code_fences(content);
     chunk_document_with_break_points(
@@ -279,17 +446,62 @@ pub fn chunk_document(
         max_chars,
         overlap_chars,
         window_chars,
+        boundary,
     )
 }
 
 /// [`chunk_document`] with the default 900-token char approximations.
 pub fn chunk_document_default(content: &str) -> Vec<Chunk> {
-    chunk_document(
+    chunk_document_for(content, &ChunkParams::default())
+}
+
+/// [`chunk_document`] with `params` in the ~4 chars/token approximation.
+pub fn chunk_document_for(content: &str, params: &ChunkParams) -> Vec<Chunk> {
+    chunk_document_bounded(
         content,
-        CHUNK_SIZE_CHARS,
-        CHUNK_OVERLAP_CHARS,
-        CHUNK_WINDOW_CHARS,
+        params.size_tokens * 4,
+        params.overlap_tokens * 4,
+        params.window_tokens * 4,
+        params.boundary,
     )
+}
+
+/// Chars per token of the token chunker's char-space first pass: a moderate
+/// estimate (prose ~4, code ~2, mixed ~3); oversize chunks are re-split with
+/// the measured ratio.
+const TOKEN_PASS_CHARS_PER_TOKEN: usize = 3;
+
+/// The chunks [`chunk_document_by_tokens_for`] stored at byte offsets
+/// `positions`, rebuilt without the tokenizer from its char-space first pass,
+/// which every chunk the re-split leaves alone comes from unchanged. A
+/// re-split piece, absent from that pass, is approximated by a first-pass
+/// length of text from its offset.
+pub fn token_chunks_at(content: &str, params: &ChunkParams, positions: &[usize]) -> Vec<Chunk> {
+    let max_chars = params.size_tokens * TOKEN_PASS_CHARS_PER_TOKEN;
+    let first_pass = chunk_document_bounded(
+        content,
+        max_chars,
+        params.overlap_tokens * TOKEN_PASS_CHARS_PER_TOKEN,
+        params.window_tokens * TOKEN_PASS_CHARS_PER_TOKEN,
+        params.boundary,
+    );
+    positions
+        .iter()
+        .map(|&pos| {
+            first_pass
+                .iter()
+                .find(|c| c.pos == pos)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let start = floor_char_boundary(content, pos.min(content.len()));
+                    let end = floor_char_boundary(content, (start + max_chars).min(content.len()));
+                    Chunk {
+                        text: content[start..end].to_owned(),
+                        pos: start,
+                    }
+                })
+        })
+        .collect()
 }
 
 /// Chunk a document by actual token count using the model tokenizer:
@@ -305,12 +517,45 @@ pub fn chunk_document_by_tokens(
     overlap_tokens: usize,
     window_tokens: usize,
 ) -> Result<Vec<TokenChunk>> {
-    let avg_chars_per_token = 3;
+    chunk_by_tokens(
+        content,
+        tokenizer,
+        &ChunkParams {
+            size_tokens: max_tokens,
+            overlap_tokens,
+            window_tokens,
+            boundary: ChunkBoundary::Window,
+        },
+    )
+}
+
+fn chunk_by_tokens(
+    content: &str,
+    tokenizer: &dyn Tokenizer,
+    params: &ChunkParams,
+) -> Result<Vec<TokenChunk>> {
+    let ChunkParams {
+        size_tokens: max_tokens,
+        overlap_tokens,
+        window_tokens,
+        boundary,
+    } = *params;
+    let avg_chars_per_token = TOKEN_PASS_CHARS_PER_TOKEN;
     let max_chars = max_tokens * avg_chars_per_token;
     let overlap_chars = overlap_tokens * avg_chars_per_token;
     let window_chars = window_tokens * avg_chars_per_token;
 
-    let char_chunks = chunk_document(content, max_chars, overlap_chars, window_chars);
+    let break_points = scan_break_points(content);
+    let code_fences = find_code_fences(content);
+    let char_chunks = chunk_document_with_break_points(
+        content,
+        &break_points,
+        &code_fences,
+        max_chars,
+        overlap_chars,
+        window_chars,
+        boundary,
+    );
 
     let mut results: Vec<TokenChunk> = Vec::new();
     for chunk in char_chunks {
@@ -322,6 +567,8 @@ pub fn chunk_document_by_tokens(
             max_tokens,
             overlap_chars,
             window_chars,
+            boundary,
+            &code_fences,
         )?;
     }
     Ok(results)
@@ -335,13 +582,19 @@ pub fn chunk_document_by_tokens_default(
     content: &str,
     tokenizer: &dyn Tokenizer,
 ) -> Result<Vec<TokenChunk>> {
-    chunk_document_by_tokens(
-        content,
-        tokenizer,
-        CHUNK_SIZE_TOKENS,
-        CHUNK_OVERLAP_TOKENS,
-        CHUNK_WINDOW_TOKENS,
-    )
+    chunk_document_by_tokens_for(content, tokenizer, &ChunkParams::default())
+}
+
+/// [`chunk_document_by_tokens`] with `params`.
+///
+/// # Errors
+/// Propagates tokenizer failures.
+pub fn chunk_document_by_tokens_for(
+    content: &str,
+    tokenizer: &dyn Tokenizer,
+    params: &ChunkParams,
+) -> Result<Vec<TokenChunk>> {
+    chunk_by_tokens(content, tokenizer, params)
 }
 
 fn clamp_overlap_chars(value: f64, max_chars: usize) -> usize {
@@ -353,10 +606,24 @@ fn clamp_overlap_chars(value: f64, max_chars: usize) -> usize {
     floored.min(max_chars - 1)
 }
 
+/// The document's `fences` that overlap `start..start + len`, in that
+/// piece's coordinates.
+fn fences_within(fences: &[CodeFenceRegion], start: usize, len: usize) -> Vec<CodeFenceRegion> {
+    fences
+        .iter()
+        .filter(|f| f.end > start && f.start < start + len)
+        .map(|f| CodeFenceRegion {
+            start: f.start.saturating_sub(start),
+            end: (f.end - start).min(len),
+        })
+        .collect()
+}
+
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments
 )]
 fn push_chunk_within_token_limit(
     results: &mut Vec<TokenChunk>,
@@ -366,6 +633,8 @@ fn push_chunk_within_token_limit(
     max_tokens: usize,
     overlap_chars: usize,
     window_chars: usize,
+    boundary: ChunkBoundary,
+    doc_fences: &[CodeFenceRegion],
 ) -> Result<()> {
     let tokens = tokenizer.count_tokens(text)?;
     if tokens <= max_tokens || text.chars().count() <= 1 {
@@ -389,7 +658,19 @@ fn push_chunk_within_token_limit(
         safe_max_chars,
     );
     let mut next_window = (window_chars as f64 * actual_chars_per_token / 2.0).floor() as usize;
-    let mut sub_chunks = chunk_document(text, safe_max_chars, next_overlap, next_window);
+    let sub_fences = match boundary {
+        ChunkBoundary::Window => find_code_fences(text),
+        ChunkBoundary::Heading => fences_within(doc_fences, pos, text.len()),
+    };
+    let mut sub_chunks = chunk_document_with_break_points(
+        text,
+        &scan_break_points(text),
+        &sub_fences,
+        safe_max_chars,
+        next_overlap,
+        next_window,
+        boundary,
+    );
 
     if sub_chunks.len() <= 1
         || sub_chunks
@@ -426,6 +707,8 @@ fn push_chunk_within_token_limit(
             max_tokens,
             overlap_chars,
             window_chars,
+            boundary,
+            doc_fences,
         )?;
     }
     Ok(())
@@ -612,6 +895,29 @@ mod tests {
     }
 
     #[test]
+    fn chunk_params_follow_the_size() {
+        let default = ChunkParams::default();
+        assert_eq!(
+            (
+                default.size_tokens,
+                default.overlap_tokens,
+                default.window_tokens
+            ),
+            (900, 135, 200)
+        );
+        assert!(default.is_default());
+        let small = ChunkParams::for_size(300);
+        assert_eq!((small.overlap_tokens, small.window_tokens), (45, 150));
+        assert_eq!(ChunkParams::for_size(1).size_tokens, MIN_CHUNK_TOKENS);
+        assert_eq!(ChunkParams::for_size(10_000).size_tokens, MAX_CHUNK_TOKENS);
+
+        let content = "Word ".repeat(2500);
+        let chunks = chunk_document_for(&content, &small);
+        assert!(chunks.len() > 8);
+        assert!(chunks.iter().all(|c| c.text.len() <= 1200));
+    }
+
+    #[test]
     fn chunking_prefers_headings_in_window() {
         let section1 = "Introduction text here. ".repeat(70);
         let section2 = "Main content text here. ".repeat(50);
@@ -620,6 +926,160 @@ mod tests {
         let heading_pos = content.find("\n# Main Section").unwrap();
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].text.len(), heading_pos);
+    }
+
+    /// A heading at 60% of the chunk, a blank line near the target cut.
+    fn heading_then_blank() -> (String, usize) {
+        let intro = "Introduction text here. ".repeat(50);
+        let body = "Body text goes on here. ".repeat(30);
+        let tail = "More words after it all. ".repeat(80);
+        let content = format!("{intro}\n## Section\n{body}\n\n{tail}");
+        let heading = content.find("\n## Section").unwrap();
+        (content, heading)
+    }
+
+    #[test]
+    fn window_boundary_takes_the_nearer_blank_and_overlaps() {
+        let (content, heading) = heading_then_blank();
+        let chunks = chunk_document(&content, 2000, 300, 400);
+        assert_eq!(chunks[0].text.len(), content.find("\n\n").unwrap());
+        assert!(chunks[1].pos < chunks[0].text.len(), "overlaps");
+        assert_ne!(chunks[1].pos, heading + 1);
+    }
+
+    #[test]
+    fn heading_boundary_cuts_at_a_late_heading_without_overlap() {
+        let (content, heading) = heading_then_blank();
+        let chunks = chunk_document_bounded(&content, 2000, 300, 400, ChunkBoundary::Heading);
+        assert_eq!(chunks[0].text.len(), heading);
+        assert_eq!(chunks[1].pos, heading + 1);
+        assert!(chunks[1].text.starts_with("## Section\n"));
+    }
+
+    #[test]
+    fn heading_boundary_takes_a_heading_just_past_the_first_quarter() {
+        let content = format!(
+            "{}\n# Third\n{}",
+            "a ".repeat(300),
+            "Body text. ".repeat(300)
+        );
+        let chunks = chunk_document_bounded(&content, 2000, 300, 400, ChunkBoundary::Heading);
+        assert_eq!(chunks[0].text.len(), 600);
+        assert!(chunks[1].text.starts_with("# Third\n"));
+    }
+
+    #[test]
+    fn heading_boundary_ignores_first_quarter_headings_and_fenced_ones() {
+        let early = format!(
+            "{}\n# Early\n{}",
+            "a ".repeat(200),
+            "Body text. ".repeat(300)
+        );
+        let chunks = chunk_document_bounded(&early, 2000, 300, 400, ChunkBoundary::Heading);
+        let window = chunk_document(&early, 2000, 300, 400);
+        assert_eq!(chunks[0], window[0], "no heading after the first quarter");
+        assert!(
+            chunks[1].pos < chunks[0].text.len(),
+            "a non-heading cut overlaps"
+        );
+
+        let fenced = format!(
+            "{}\n```\n# not a heading\n```\n{}",
+            "Body text. ".repeat(130),
+            "More text. ".repeat(200)
+        );
+        let chunks = chunk_document_bounded(&fenced, 2000, 300, 400, ChunkBoundary::Heading);
+        assert!(!chunks.iter().any(|c| c.text.starts_with("# not")));
+    }
+
+    #[test]
+    fn heading_boundary_does_not_cut_at_a_thematic_break() {
+        let content = format!(
+            "{}\nTitle\n---\n{}",
+            "Lead words go here. ".repeat(60),
+            "Body words. ".repeat(200)
+        );
+        let chunks = chunk_document_bounded(&content, 2000, 300, 400, ChunkBoundary::Heading);
+        let window = chunk_document(&content, 2000, 300, 400);
+        assert_eq!(chunks, window);
+    }
+
+    #[test]
+    fn heading_boundary_overlaps_after_a_cut_on_a_fenced_comment() {
+        let lines: String = (0..400).map(|i| format!("# comment {i:03}\n")).collect();
+        let content = (0..16)
+            .map(|pad| format!("{}\n```sh\n{lines}```\nTail.", "a".repeat(300 + pad)))
+            .find(|c| c[2000..].starts_with("\n#"))
+            .unwrap();
+        let chunks = chunk_document_bounded(&content, 2000, 300, 400, ChunkBoundary::Heading);
+        assert_eq!(chunks[0].text.len(), 2000);
+        assert_eq!(chunks[1].pos, 1700, "overlaps as a window cut does");
+    }
+
+    #[test]
+    fn heading_resplit_reads_the_documents_fences() {
+        struct Dense;
+        impl Tokenizer for Dense {
+            fn count_tokens(&self, text: &str) -> Result<usize> {
+                Ok(text.chars().count().div_ceil(2))
+            }
+            fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> Result<String> {
+                Ok(text.chars().take(max_tokens * 2).collect())
+            }
+        }
+        let steps: String = (0..30)
+            .map(|i| format!("# step {i}\nrun thing {i}\n"))
+            .collect();
+        let content = format!(
+            "{}\n```sh\n{steps}```\n{}",
+            "Lead sentence words. ".repeat(25),
+            "Tail sentence words. ".repeat(60)
+        );
+        let params = ChunkParams::for_size(200).with_boundary(ChunkBoundary::Heading);
+        let chunks = chunk_document_by_tokens_for(&content, &Dense, &params).unwrap();
+        assert!(chunks.iter().all(|c| !c.text.starts_with("# step")));
+    }
+
+    #[test]
+    fn heading_boundary_holds_through_the_token_resplit() {
+        struct Dense;
+        impl Tokenizer for Dense {
+            fn count_tokens(&self, text: &str) -> Result<usize> {
+                Ok(text.chars().count().div_ceil(2))
+            }
+            fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> Result<String> {
+                Ok(text.chars().take(max_tokens * 2).collect())
+            }
+        }
+        let section = |n: usize| format!("## Section {n}\n\n{}\n\n", "Some words here. ".repeat(8));
+        let content: String = (10..40).map(section).collect();
+        let params = ChunkParams::for_size(200).with_boundary(ChunkBoundary::Heading);
+        for tokenizer in [&Dense as &dyn Tokenizer, &ApproxTokenizer] {
+            let chunks = chunk_document_by_tokens_for(&content, tokenizer, &params).unwrap();
+            assert!(chunks.len() > 5);
+            for c in &chunks {
+                assert!(
+                    c.text.starts_with("## Section"),
+                    "chunk at {} mid-section",
+                    c.pos
+                );
+                assert!(c.tokens <= 200);
+            }
+        }
+        let chunks = chunk_document_by_tokens_for(&content, &ApproxTokenizer, &params).unwrap();
+        let positions: Vec<usize> = chunks.iter().map(|c| c.pos).collect();
+        let rebuilt = token_chunks_at(&content, &params, &positions);
+        for (s, r) in chunks.iter().zip(&rebuilt) {
+            assert_eq!((s.pos, s.text.as_str()), (r.pos, r.text.as_str()));
+        }
+    }
+
+    #[test]
+    fn chunk_boundary_parses() {
+        assert_eq!("Heading".parse(), Ok(ChunkBoundary::Heading));
+        assert_eq!("window".parse(), Ok(ChunkBoundary::Window));
+        assert!("section".parse::<ChunkBoundary>().is_err());
+        assert_eq!(ChunkParams::default().boundary, ChunkBoundary::Window);
     }
 
     #[test]
@@ -674,6 +1134,35 @@ mod tests {
         for w in chunks.windows(2) {
             assert!(w[1].pos < w[0].pos + w[0].text.len(), "chunks must overlap");
         }
+    }
+
+    #[test]
+    fn token_chunks_rebuild_from_their_offsets() {
+        let content = "## Section\n\nThe quick brown fox jumps over the lazy dog.\n\n".repeat(200);
+        let params = ChunkParams::for_size(200);
+        let stored = chunk_document_by_tokens_for(&content, &ApproxTokenizer, &params).unwrap();
+        assert!(stored.len() > 2);
+        let positions: Vec<usize> = stored.iter().map(|c| c.pos).collect();
+        let rebuilt = token_chunks_at(&content, &params, &positions);
+        for (s, r) in stored.iter().zip(&rebuilt) {
+            assert_eq!((s.pos, s.text.as_str()), (r.pos, r.text.as_str()));
+        }
+
+        struct Dense;
+        impl Tokenizer for Dense {
+            fn count_tokens(&self, text: &str) -> Result<usize> {
+                Ok(text.chars().count())
+            }
+            fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> Result<String> {
+                Ok(text.chars().take(max_tokens).collect())
+            }
+        }
+        let pieces = chunk_document_by_tokens_for(&content, &Dense, &params).unwrap();
+        let piece = pieces.iter().find(|p| !positions.contains(&p.pos)).unwrap();
+        let rebuilt = token_chunks_at(&content, &params, &[piece.pos]);
+        assert_eq!(rebuilt[0].pos, piece.pos);
+        assert!(rebuilt[0].text.starts_with(&piece.text));
+        assert_eq!(rebuilt[0].text.len(), 200 * TOKEN_PASS_CHARS_PER_TOKEN);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+use crate::chunk::{ChunkBoundary, ChunkParams};
 use crate::config::{Collection, CollectionConfig, ContextMap, NamedCollection};
 use crate::error::Result;
 use crate::store::Store;
@@ -31,12 +32,17 @@ impl Store {
              FROM store_collections",
         )?;
         let rows = stmt.query_map([], row_to_named_collection)?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let mut named: Vec<NamedCollection> = rows.collect::<std::result::Result<_, _>>()?;
+        for n in &mut named {
+            n.collection.chunk_tokens = self.chunk_tokens_setting(&n.name)?;
+            n.collection.chunk_boundary = self.chunk_boundary_setting(&n.name)?;
+        }
+        Ok(named)
     }
 
     /// One mirrored collection by name.
     pub fn store_collection(&self, name: &str) -> Result<Option<NamedCollection>> {
-        Ok(self
+        let named = self
             .conn()
             .query_row(
                 "SELECT name, path, pattern, ignore_patterns, include_by_default,
@@ -45,7 +51,14 @@ impl Store {
                 params![name],
                 row_to_named_collection,
             )
-            .optional()?)
+            .optional()?;
+        named
+            .map(|mut n| {
+                n.collection.chunk_tokens = self.chunk_tokens_setting(name)?;
+                n.collection.chunk_boundary = self.chunk_boundary_setting(name)?;
+                Ok(n)
+            })
+            .transpose()
     }
 
     /// Insert or update one mirrored collection row.
@@ -79,7 +92,79 @@ impl Store {
                 context_json,
             ],
         )?;
+        self.set_chunk_settings(name, collection)
+    }
+
+    /// Chunk size and boundary are kept in `store_config`
+    /// (`chunk_tokens:<collection>`, `chunk_boundary:<collection>`) rather
+    /// than new `store_collections` columns, so the table stays the TS layout.
+    fn set_chunk_settings(&self, name: &str, collection: &Collection) -> Result<()> {
+        self.set_collection_setting(
+            "chunk_tokens",
+            name,
+            collection.chunk_tokens.map(|t| t.to_string()),
+        )?;
+        self.set_collection_setting(
+            "chunk_boundary",
+            name,
+            collection.chunk_boundary.map(|b| b.as_str().to_owned()),
+        )
+    }
+
+    fn clear_chunk_settings(&self, name: &str) -> Result<()> {
+        self.set_chunk_settings(name, &Collection::new("", ""))
+    }
+
+    fn set_collection_setting(
+        &self,
+        prefix: &str,
+        name: &str,
+        value: Option<String>,
+    ) -> Result<()> {
+        let key = format!("{prefix}:{name}");
+        match value {
+            Some(value) => self.conn().execute(
+                "INSERT INTO store_config (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?,
+            None => self
+                .conn()
+                .execute("DELETE FROM store_config WHERE key = ?1", params![key])?,
+        };
         Ok(())
+    }
+
+    fn collection_setting(&self, prefix: &str, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT value FROM store_config WHERE key = ?1",
+                params![format!("{prefix}:{name}")],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn chunk_tokens_setting(&self, name: &str) -> Result<Option<usize>> {
+        Ok(self
+            .collection_setting("chunk_tokens", name)?
+            .and_then(|v| v.parse().ok()))
+    }
+
+    fn chunk_boundary_setting(&self, name: &str) -> Result<Option<ChunkBoundary>> {
+        Ok(self
+            .collection_setting("chunk_boundary", name)?
+            .and_then(|v| v.parse().ok()))
+    }
+
+    /// Chunk geometry for a collection: its `chunkTokens` and
+    /// `chunkBoundary`, else the defaults.
+    pub fn collection_chunk_params(&self, name: &str) -> Result<ChunkParams> {
+        Ok(self
+            .chunk_tokens_setting(name)?
+            .map_or_else(ChunkParams::default, ChunkParams::for_size)
+            .with_boundary(self.chunk_boundary_setting(name)?.unwrap_or_default()))
     }
 
     /// Sync external config into `store_collections`. External config always
@@ -115,6 +200,7 @@ impl Store {
                     "DELETE FROM store_collections WHERE name = ?1",
                     params![name],
                 )?;
+                self.clear_chunk_settings(&name)?;
             }
         }
 
@@ -196,6 +282,7 @@ impl Store {
             "DELETE FROM store_collections WHERE name = ?1",
             params![name],
         )?;
+        self.clear_chunk_settings(name)?;
         Ok((deleted, cleaned))
     }
 
@@ -273,6 +360,8 @@ fn row_to_named_collection(r: &rusqlite::Row<'_>) -> rusqlite::Result<NamedColle
             include_by_default: (include_by_default == 0).then_some(false),
             update: r.get(5)?,
             context: context_json.and_then(|j| serde_json::from_str::<ContextMap>(&j).ok()),
+            chunk_tokens: None,
+            chunk_boundary: None,
         },
     })
 }
@@ -288,5 +377,16 @@ mod tests {
         assert!(path_under_prefix("/docs", "/docs"));
         assert!(path_under_prefix("/docs/a.md", "/"));
         assert!(!path_under_prefix("/docs-old/a.md", "/docs"));
+    }
+
+    #[test]
+    fn removing_a_collection_clears_its_chunk_settings() {
+        let store = Store::open_in_memory().unwrap();
+        let mut collection = Collection::new("/n", "**/*.md");
+        collection.chunk_tokens = Some(300);
+        collection.chunk_boundary = Some(ChunkBoundary::Heading);
+        store.upsert_store_collection("n", &collection).unwrap();
+        store.remove_collection("n").unwrap();
+        assert!(store.collection_chunk_params("n").unwrap().is_default());
     }
 }

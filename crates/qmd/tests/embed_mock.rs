@@ -75,3 +75,78 @@ fn force_and_model_change_invalidate_embeddings() {
     assert_eq!(forced.docs_processed, 6);
     assert!(forced.chunks_embedded >= 6);
 }
+
+#[test]
+fn collection_chunk_size_rechunks_and_replaces_the_old_set() {
+    let store = common::indexed_store();
+    let mock = MockEmbedder::default();
+    let default_run = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+
+    let mut collection = qmd::config::Collection::new("/eval-docs", "**/*.md");
+    collection.chunk_tokens = Some(128);
+    store
+        .upsert_store_collection("eval-docs", &collection)
+        .unwrap();
+
+    let small = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert_eq!(
+        small.docs_processed, 6,
+        "a new size re-embeds the collection"
+    );
+    assert!(small.chunks_embedded > default_run.chunks_embedded);
+
+    let fingerprint = qmd::embed::embedding_fingerprint_for(
+        mock.model_uri(),
+        &qmd::chunk::ChunkParams::for_size(128),
+    );
+    let (stored, stale): (i64, i64) = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*), SUM(embed_fingerprint != ?1) FROM content_vectors",
+            [&fingerprint],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored as usize, small.chunks_embedded);
+    assert_eq!(stale, 0, "no chunk of the 900-token set survives");
+    assert!(
+        store
+            .pending_embedding_docs(None, mock.model_uri())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn collection_chunk_boundary_reembeds_and_replaces_the_old_set() {
+    use qmd::chunk::{ChunkBoundary, ChunkParams};
+    let store = common::indexed_store();
+    let mock = MockEmbedder::default();
+    generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+
+    let mut collection = qmd::config::Collection::new("/eval-docs", "**/*.md");
+    collection.chunk_boundary = Some(ChunkBoundary::Heading);
+    store
+        .upsert_store_collection("eval-docs", &collection)
+        .unwrap();
+    assert_eq!(
+        store.collection_chunk_params("eval-docs").unwrap(),
+        ChunkParams::default().with_boundary(ChunkBoundary::Heading)
+    );
+
+    let heading = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert_eq!(heading.docs_processed, 6, "a new boundary re-embeds");
+    let fingerprint = qmd::embed::embedding_fingerprint_for(
+        mock.model_uri(),
+        &ChunkParams::default().with_boundary(ChunkBoundary::Heading),
+    );
+    let stale: i64 = store
+        .conn()
+        .query_row(
+            "SELECT SUM(embed_fingerprint != ?1) FROM content_vectors",
+            [&fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "no window-cut chunk survives");
+}

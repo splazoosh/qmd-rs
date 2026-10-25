@@ -32,3 +32,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked $FEATURES
       - run: cargo test --release --locked $FEATURES
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked $FEATURES -- -D warnings

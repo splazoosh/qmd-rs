@@ -91,7 +91,10 @@ fn an_empty_contact_sends_and_records_the_user_agent_without_one() {
 
     let bare = format!("qmd-archive/{}", env!("CARGO_PKG_VERSION"));
     let requests = f.fetcher.requests.lock().unwrap();
-    assert!(requests.iter().all(|(_, agent)| *agent == bare), "{requests:?}");
+    assert!(
+        requests.iter().all(|(_, agent)| *agent == bare),
+        "{requests:?}"
+    );
     assert_eq!(archive.get(URL).unwrap().user_agent, bare);
 }
 

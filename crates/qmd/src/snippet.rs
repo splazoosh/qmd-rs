@@ -11,6 +11,7 @@ pub const INTENT_WEIGHT_SNIPPET: f64 = 0.3;
 
 /// Common stop words filtered from intent strings before tokenization
 /// (TS `INTENT_STOP_WORDS`).
+#[rustfmt::skip]
 static INTENT_STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "am", "an", "as", "at", "be", "by", "do", "he", "if", "in", "is", "it", "me", "my", "no",

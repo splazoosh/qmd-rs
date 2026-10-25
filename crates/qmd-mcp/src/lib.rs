@@ -21,7 +21,7 @@ use rmcp::ServiceExt as _;
 
 pub use http::HttpServer;
 pub use server::QmdServer;
-pub use worker::{EmbedderFactory, Index, Worker};
+pub use worker::{EmbedderFactory, Factories, Index, RerankerFactory, Worker};
 
 /// Serve MCP over stdin/stdout until the client disconnects.
 ///
@@ -33,9 +33,9 @@ pub async fn serve_stdio(
     config_path: &Path,
     db_path: &Path,
     model: String,
-    embedder: EmbedderFactory,
+    factories: Factories,
 ) -> Result<()> {
-    let worker = Worker::spawn(config_path, db_path, model, embedder)?;
+    let worker = Worker::spawn(config_path, db_path, model, factories)?;
     let server = QmdServer::new(worker).await?;
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
@@ -53,12 +53,12 @@ pub async fn serve_http(
     config_path: &Path,
     db_path: &Path,
     model: String,
-    embedder: EmbedderFactory,
+    factories: Factories,
     addr: std::net::SocketAddr,
     on_bound: impl FnOnce(std::net::SocketAddr),
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let worker = Worker::spawn(config_path, db_path, model, embedder)?;
+    let worker = Worker::spawn(config_path, db_path, model, factories)?;
     let server = QmdServer::new(worker).await?;
     let http = HttpServer::bind(server, addr).await?;
     on_bound(http.local_addr()?);

@@ -35,8 +35,14 @@ fn embedded_store() -> (Store, LlamaEmbedder) {
 }
 
 fn hybrid_hit(store: &Store, embedder: &LlamaEmbedder, eq: &EvalQuery, top_k: usize) -> bool {
-    let response = hybrid_query(store, Some(embedder), eq.query, &HybridOptions::default())
-        .expect("hybrid query");
+    let response = hybrid_query(
+        store,
+        Some(embedder),
+        None,
+        eq.query,
+        &HybridOptions::default(),
+    )
+    .expect("hybrid query");
     response
         .results
         .iter()

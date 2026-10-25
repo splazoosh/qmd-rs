@@ -9,11 +9,13 @@ mod llama;
 
 pub use generate::{EmbedFailure, EmbedOptions, EmbedProgress, EmbedResult, generate_embeddings};
 #[cfg(feature = "llama")]
+pub(crate) use llama::backend as llama_backend;
+#[cfg(feature = "llama")]
 pub use llama::{LlamaEmbedder, gpu_offload};
 
 use sha2::{Digest, Sha256};
 
-use crate::chunk::{CHUNK_OVERLAP_TOKENS, CHUNK_SIZE_TOKENS, Tokenizer};
+use crate::chunk::{ChunkBoundary, ChunkParams, Tokenizer};
 use crate::error::Result;
 
 const EMBED_FINGERPRINT_PROBE_QUERY: &str = "__qmd_embedding_query_probe__";
@@ -56,7 +58,14 @@ pub fn format_doc_for_embedding(text: &str, title: Option<&str>, model_uri: &str
 /// inputs (model URI, prompt templates, chunking constants). A change
 /// invalidates stored vectors.
 pub fn embedding_fingerprint(model: &str) -> String {
-    let significant = [
+    embedding_fingerprint_for(model, &ChunkParams::default())
+}
+
+/// [`embedding_fingerprint`] for vectors chunked with `chunk`. The window is
+/// derived from the size, so size, overlap and boundary fix the chunking. The
+/// default boundary adds no line, so default vectors keep the TS fingerprint.
+pub fn embedding_fingerprint_for(model: &str, chunk: &ChunkParams) -> String {
+    let mut significant = vec![
         format!("model:{model}"),
         format!(
             "query:{}",
@@ -70,11 +79,13 @@ pub fn embedding_fingerprint(model: &str) -> String {
                 model
             )
         ),
-        format!("chunk_tokens:{CHUNK_SIZE_TOKENS}"),
-        format!("chunk_overlap_tokens:{CHUNK_OVERLAP_TOKENS}"),
-    ]
-    .join("\n");
-    let digest = Sha256::digest(significant.as_bytes());
+        format!("chunk_tokens:{}", chunk.size_tokens),
+        format!("chunk_overlap_tokens:{}", chunk.overlap_tokens),
+    ];
+    if chunk.boundary != ChunkBoundary::Window {
+        significant.push(format!("chunk_boundary:{}", chunk.boundary.as_str()));
+    }
+    let digest = Sha256::digest(significant.join("\n").as_bytes());
     hex::encode(digest)[..6].to_owned()
 }
 
@@ -209,6 +220,11 @@ mod tests {
         assert_eq!(embedding_fingerprint(DEFAULT_EMBED_MODEL), "c37385");
         assert_ne!(
             embedding_fingerprint("hf:other/model/file.gguf"),
+            embedding_fingerprint(DEFAULT_EMBED_MODEL)
+        );
+        let heading = ChunkParams::default().with_boundary(ChunkBoundary::Heading);
+        assert_ne!(
+            embedding_fingerprint_for(DEFAULT_EMBED_MODEL, &heading),
             embedding_fingerprint(DEFAULT_EMBED_MODEL)
         );
     }

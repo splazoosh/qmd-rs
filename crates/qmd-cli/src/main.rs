@@ -65,6 +65,13 @@ enum Command {
         /// Domain intent hint for disambiguation
         #[arg(long)]
         intent: Option<String>,
+        /// Rerank the fused candidates with the cross-encoder (overrides the
+        /// config's search.rerank)
+        #[arg(long, overrides_with = "no_rerank")]
+        rerank: bool,
+        /// Do not rerank, whatever the config says
+        #[arg(long)]
+        no_rerank: bool,
         #[command(flatten)]
         output: SearchOptions,
     },
@@ -176,6 +183,13 @@ enum CollectionCommand {
         /// also applies to every later `qmd update`)
         #[arg(long = "ignore")]
         ignore: Vec<String>,
+        /// Chunk size in tokens for this collection (default 900; 64 to 1800)
+        #[arg(long)]
+        chunk_tokens: Option<usize>,
+        /// Where chunks are cut: window (default) or heading, which starts a
+        /// chunk at a heading with no overlap
+        #[arg(long, value_name = "window|heading")]
+        chunk_boundary: Option<qmd::chunk::ChunkBoundary>,
     },
     /// List all collections
     List,
@@ -206,6 +220,10 @@ struct SearchOptions {
     /// Filter by collection (repeatable)
     #[arg(short = 'c', long = "collection")]
     collections: Vec<String>,
+    /// How BM25 terms combine: any (default) or all (search and query;
+    /// overrides the config's search.match)
+    #[arg(long = "match", value_name = "all|any")]
+    term_match: Option<qmd::store::TermMatch>,
 }
 
 fn main() {
@@ -221,7 +239,17 @@ fn main() {
                 name,
                 mask,
                 ignore,
-            } => commands::collection_add(&location, &path, name.as_deref(), &mask, &ignore),
+                chunk_tokens,
+                chunk_boundary,
+            } => commands::collection_add(
+                &location,
+                &path,
+                name.as_deref(),
+                &mask,
+                &ignore,
+                chunk_tokens,
+                chunk_boundary,
+            ),
             CollectionCommand::List => commands::collection_list(&location),
             CollectionCommand::Remove { name } => commands::collection_remove(&location, &name),
         },
@@ -245,8 +273,17 @@ fn main() {
         Command::Query {
             query,
             intent,
+            rerank,
+            no_rerank,
             output,
-        } => commands::query(&location, &query, intent.as_deref(), &output),
+        } => {
+            let rerank = match (rerank, no_rerank) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            commands::query(&location, &query, intent.as_deref(), rerank, &output)
+        }
         Command::Search { query, output } => commands::search(&location, &query, &output),
         Command::Vsearch { query, output } => commands::vsearch(&location, &query, &output),
         Command::Embed { force, collection } => {

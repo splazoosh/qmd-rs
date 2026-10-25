@@ -147,6 +147,45 @@ async fn query_returns_ranked_rows_as_structured_content() {
 }
 
 #[tokio::test]
+async fn query_takes_match_and_rerank() {
+    let fixture = Fixture::build();
+    let (client, _) = connect(&fixture).await;
+
+    let lex = |mode: &str| {
+        json!({
+            "searches": [{ "type": "lex", "query": "sourdough bones" }],
+            "match": mode,
+        })
+    };
+    let all = call(&client, "query", lex("all")).await;
+    let rows = all.structured_content.expect("structured content");
+    assert!(rows["results"].as_array().unwrap().is_empty());
+    let any = call(&client, "query", lex("any")).await;
+    let rows = any.structured_content.expect("structured content");
+    assert_eq!(rows["results"].as_array().unwrap().len(), 2);
+
+    let reranked = call(
+        &client,
+        "query",
+        json!({ "query": "raft leader election", "rerank": true }),
+    )
+    .await;
+    assert_ne!(reranked.is_error, Some(true), "{}", text_of(&reranked));
+    let rows = reranked.structured_content.expect("structured content");
+    assert_eq!(rows["results"][0]["file"], "notes/raft.md");
+
+    let bad = call(
+        &client,
+        "query",
+        json!({ "query": "raft", "match": "some" }),
+    )
+    .await;
+    assert_eq!(bad.is_error, Some(true));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn query_rejects_both_arms_at_once_as_a_tool_error() {
     let fixture = Fixture::build();
     let (client, _) = connect(&fixture).await;

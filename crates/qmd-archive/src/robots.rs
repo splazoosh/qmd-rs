@@ -192,13 +192,13 @@ fn parse(text: &str) -> Vec<Group> {
             }
             "allow" | "disallow" => {
                 in_agents = false;
-                if let Some(group) = groups.last_mut() {
-                    if !(field == "disallow" && value.is_empty()) {
-                        group.rules.push(Rule {
-                            allow: field == "allow",
-                            pattern: value.to_owned(),
-                        });
-                    }
+                if let Some(group) = groups.last_mut()
+                    && !(field == "disallow" && value.is_empty())
+                {
+                    group.rules.push(Rule {
+                        allow: field == "allow",
+                        pattern: value.to_owned(),
+                    });
                 }
             }
             "crawl-delay" => {

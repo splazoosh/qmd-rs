@@ -10,7 +10,7 @@ use qmd::query::{
 };
 use qmd::querylog::{self, Arm, Via};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
-use qmd::store::{DocumentLookup, DocumentResult};
+use qmd::store::{DocumentLookup, DocumentResult, TermMatch};
 use serde::{Deserialize, Serialize};
 
 use crate::worker::Index;
@@ -88,6 +88,32 @@ pub struct QueryParams {
     /// snippet selection; does not search on its own.
     #[serde(default)]
     pub intent: Option<String>,
+    /// How BM25 terms combine, in a plain query and in every lex sub-query:
+    /// "all" (every term must appear) or "any" (any may; documents holding
+    /// more rank higher). Defaults to the index config, else "any".
+    #[serde(default, rename = "match")]
+    pub term_match: Option<TermMatchParam>,
+    /// Rerank the fused candidates with the cross-encoder (slower). Defaults
+    /// to the index config, else false.
+    #[serde(default)]
+    pub rerank: Option<bool>,
+}
+
+/// BM25 term combination for `query`.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TermMatchParam {
+    All,
+    Any,
+}
+
+impl From<TermMatchParam> for TermMatch {
+    fn from(value: TermMatchParam) -> Self {
+        match value {
+            TermMatchParam::All => Self::All,
+            TermMatchParam::Any => Self::Any,
+        }
+    }
 }
 
 /// One row of `query` output. Field names match `qmd query --format json`.
@@ -145,6 +171,8 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
         })
         .collect();
 
+    let settings = index.config.search_settings();
+    let rerank = params.rerank.or(settings.rerank).unwrap_or(false);
     let options = HybridOptions {
         collections: names,
         limit: params.limit.unwrap_or(10),
@@ -153,6 +181,12 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
             .candidate_limit
             .unwrap_or(qmd::query::CANDIDATE_LIMIT),
         intent: params.intent.clone(),
+        term_match: params
+            .term_match
+            .map(TermMatch::from)
+            .or(settings.term_match)
+            .unwrap_or_default(),
+        ..HybridOptions::default()
     };
 
     let display_query = if typed.is_empty() {
@@ -173,13 +207,18 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
     if needs_embedder {
         index.ensure_embedder()?;
     }
+    if rerank {
+        index.ensure_reranker()?;
+    }
+    let reranker = if rerank { index.reranker() } else { None };
     let embedder = index.embedder();
     let store = &index.store;
     let response = if typed.is_empty() {
         let text = params.query.as_deref().unwrap_or_default();
-        hybrid_query(store, embedder, text, &options).map_err(|e| anyhow!("{e}"))?
+        hybrid_query(store, embedder, reranker, text, &options).map_err(|e| anyhow!("{e}"))?
     } else {
-        structured_search(store, embedder, &typed, &options).map_err(|e| anyhow!("{e}"))?
+        structured_search(store, embedder, reranker, &typed, &options)
+            .map_err(|e| anyhow!("{e}"))?
     };
 
     let mut results = response.results;

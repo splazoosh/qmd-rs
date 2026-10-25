@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::chunk::chunk_document_by_tokens_default;
-use crate::embed::{EmbeddingBackend, embedding_fingerprint, format_doc_for_embedding};
+use crate::chunk::chunk_document_by_tokens_for;
+use crate::embed::{EmbeddingBackend, embedding_fingerprint_for, format_doc_for_embedding};
 use crate::error::Result;
 use crate::store::{Store, extract_title, now_iso};
 
@@ -73,6 +73,7 @@ struct ChunkItem {
     seq: usize,
     pos: usize,
     expected_total_chunks: usize,
+    fingerprint: String,
 }
 
 /// Generate vector embeddings for all documents that need them.
@@ -89,7 +90,6 @@ pub fn generate_embeddings(
         .model
         .clone()
         .unwrap_or_else(|| backend.model_uri().to_owned());
-    let fingerprint = embedding_fingerprint(&model);
     let now = now_iso();
     let started = Instant::now();
     let max_docs = options
@@ -148,7 +148,9 @@ pub fn generate_embeddings(
                 continue;
             }
             let title = extract_title(body, &doc.path);
-            let chunks = chunk_document_by_tokens_default(body, backend)?;
+            let chunks = chunk_document_by_tokens_for(body, backend, &doc.chunk)?;
+            let fingerprint = embedding_fingerprint_for(&model, &doc.chunk);
+            store.clear_hash_embeddings(&doc.hash)?;
             let expected = chunks.len();
             for (seq, chunk) in chunks.into_iter().enumerate() {
                 batch_chunks.push(ChunkItem {
@@ -159,6 +161,7 @@ pub fn generate_embeddings(
                     seq,
                     pos: chunk.pos,
                     expected_total_chunks: expected,
+                    fingerprint: fingerprint.clone(),
                 });
             }
             expected_chunks_by_hash.insert(doc.hash.clone(), expected);
@@ -194,7 +197,7 @@ pub fn generate_embeddings(
                 &model,
                 &now,
                 chunk.expected_total_chunks as i64,
-                &fingerprint,
+                &chunk.fingerprint,
             )?;
             *chunks_embedded += 1;
             failures.remove(&(chunk.hash.clone(), chunk.seq));

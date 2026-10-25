@@ -335,5 +335,7 @@ pub fn index(location: &IndexLocation) -> Result<()> {
         Some(COLLECTION),
         MASK,
         &[],
+        None,
+        None,
     )
 }

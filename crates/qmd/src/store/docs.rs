@@ -632,6 +632,8 @@ mod tests {
             context: None,
             update: None,
             include_by_default: None,
+            chunk_tokens: None,
+            chunk_boundary: None,
         };
         store.upsert_store_collection("c", &coll).unwrap();
         add_doc(&store, "c", "x/sub/a.md");

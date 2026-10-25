@@ -2,19 +2,20 @@
 //! `hybridQuery`, `structuredSearch`, lex/semantic validators) and
 //! `cli/qmd.ts` (`parseStructuredQuery`).
 //!
-//! LLM query expansion and reranking are not implemented: a bare query fans out
-//! to BM25 + vector search on the original text, and results are scored
-//! `1/rrf_rank` (the TS `--no-rerank` path). The strong-signal probe runs so
-//! its bypass decision is reported, but with no expansion stage there is
-//! nothing for it to skip yet.
+//! LLM query expansion is not implemented: a bare query fans out to BM25 +
+//! vector search on the original text. Results are scored `1/rrf_rank` (the
+//! TS `--no-rerank` path) unless a [`Reranker`] is passed. The strong-signal
+//! probe runs so its bypass decision is reported, but with no expansion stage
+//! there is nothing for it to skip yet.
 
 use std::collections::HashMap;
 
-use crate::chunk::chunk_document_default;
+use crate::chunk::{Chunk, chunk_document_for, token_chunks_at};
 use crate::embed::{Embedder, format_query_for_embedding};
 use crate::error::{Error, Result};
+use crate::rerank::{Reranker, blend, rerank_cached};
 use crate::snippet::extract_intent_terms;
-use crate::store::{SearchResult, Store};
+use crate::store::{SearchResult, Store, TermMatch};
 
 /// Top normalized BM25 score required for the strong-signal bypass.
 pub const STRONG_SIGNAL_MIN_SCORE: f64 = 0.85;
@@ -22,8 +23,8 @@ pub const STRONG_SIGNAL_MIN_SCORE: f64 = 0.85;
 pub const STRONG_SIGNAL_MIN_GAP: f64 = 0.15;
 /// RRF rank constant.
 pub const RRF_K: f64 = 60.0;
-/// Fused candidates kept for chunking (keeps ranks 31-40 visible to a
-/// future reranker).
+/// Fused candidates kept for chunking (keeps ranks 31-40 visible to the
+/// reranker).
 pub const CANDIDATE_LIMIT: usize = 40;
 /// Per-list backend fetch limit.
 pub const PER_LIST_LIMIT: usize = 20;
@@ -298,6 +299,10 @@ pub struct HybridOptions {
     /// Domain intent hint for disambiguation (chunk selection weighting;
     /// disables the strong-signal bypass).
     pub intent: Option<String>,
+    /// How BM25 terms combine, in the probe and in every `lex` sub-query.
+    pub term_match: TermMatch,
+    /// Which chunk of each candidate the reranker reads.
+    pub rerank_chunk: RerankChunk,
 }
 
 impl Default for HybridOptions {
@@ -308,8 +313,25 @@ impl Default for HybridOptions {
             min_score: 0.0,
             candidate_limit: CANDIDATE_LIMIT,
             intent: None,
+            term_match: TermMatch::default(),
+            rerank_chunk: RerankChunk::default(),
         }
     }
+}
+
+/// Which chunk of a candidate the reranker reads. Without a query embedding,
+/// and for a candidate with no stored vectors, every rule reads the
+/// [`Self::Overlap`] chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RerankChunk {
+    /// Most query terms (TS step 5).
+    #[default]
+    Overlap,
+    /// The stored chunk whose embedding is nearest the query's — for a vector
+    /// hit, the chunk vector search matched.
+    Nearest,
+    /// The `n` nearest stored chunks, each reranked; the best score counts.
+    BestOfNearest(usize),
 }
 
 /// One ranked list of up to [`PER_LIST_LIMIT`] hits restricted to
@@ -357,12 +379,17 @@ pub struct HybridResult {
     pub display_path: String,
     pub title: String,
     pub body: String,
-    /// Best chunk text (keyword overlap; the future rerank input).
+    /// Best chunk text: the keyword-overlap chunk, or when reranked the
+    /// [`RerankChunk`] chunk that scored best.
     pub best_chunk: String,
     /// Byte offset of the best chunk in `body`.
     pub best_chunk_pos: usize,
-    /// `1 / rrf_rank` (RRF ordering preserved; there is no rerank blend).
+    /// `1 / rrf_rank`, or its blend with the rerank score when reranked.
     pub score: f64,
+    /// 1-based rank in the fused list.
+    pub rrf_rank: usize,
+    /// The reranker's score, when reranked.
+    pub rerank_score: Option<f64>,
     pub context: Option<String>,
     pub docid: String,
 }
@@ -378,6 +405,10 @@ pub struct HybridReport {
     pub queries_embedded: usize,
     /// Vector search was applicable but skipped (no embedding backend).
     pub vector_skipped: bool,
+    /// Candidates scored by the reranker (0 when it did not run).
+    pub reranked: usize,
+    /// Of those, scored by the model rather than the cache.
+    pub rerank_fresh: usize,
 }
 
 /// Results plus a report of the pipeline path taken.
@@ -388,7 +419,8 @@ pub struct HybridResponse {
 }
 
 /// Hybrid search on a bare query: BM25 + vector search on the original text,
-/// RRF fusion, best-chunk selection, `1/rrf_rank` scoring.
+/// RRF fusion, best-chunk selection, `1/rrf_rank` scoring or, with a
+/// `reranker`, the position-aware rerank blend.
 ///
 /// `embedder` may be `None` (BM25-only build); vector lists are then skipped
 /// and reported via [`HybridReport::vector_skipped`].
@@ -398,13 +430,16 @@ pub struct HybridResponse {
 pub fn hybrid_query(
     store: &Store,
     embedder: Option<&dyn Embedder>,
+    reranker: Option<&dyn Reranker>,
     query: &str,
     options: &HybridOptions,
 ) -> Result<HybridResponse> {
     let collections = &options.collections;
     let mut report = HybridReport::default();
 
-    let initial_fts = ranked_list(collections, |k, c| store.search_fts(query, k, c))?;
+    let initial_fts = ranked_list(collections, |k, c| {
+        store.search_fts_with(query, k, c, options.term_match)
+    })?;
     let top_score = initial_fts.first().map_or(0.0, |r| r.score);
     let second_score = initial_fts.get(1).map_or(0.0, |r| r.score);
     if options.intent.is_none()
@@ -422,6 +457,7 @@ pub fn hybrid_query(
         weights.push(2.0);
     }
 
+    let mut query_embedding = None;
     if store.vec_table_exists()? {
         if let Some(embedder) = embedder {
             let formatted = format_query_for_embedding(query, embedder.model_uri());
@@ -433,6 +469,7 @@ pub fn hybrid_query(
                     lists.push(vec_results);
                     weights.push(2.0);
                 }
+                query_embedding = Some(embedding);
             }
         } else {
             report.vector_skipped = true;
@@ -441,7 +478,12 @@ pub fn hybrid_query(
 
     report.lists_fused = lists.len();
     let fused = reciprocal_rank_fusion(&lists, &weights, RRF_K);
-    let results = finalize_candidates(store, fused, query, options)?;
+    let rerank = reranker.map(|r| RerankInput {
+        reranker: r,
+        query,
+        embedding: query_embedding.as_deref(),
+    });
+    let results = finalize_candidates(store, fused, query, rerank, options, &mut report)?;
     Ok(HybridResponse { results, report })
 }
 
@@ -454,6 +496,7 @@ pub fn hybrid_query(
 pub fn structured_search(
     store: &Store,
     embedder: Option<&dyn Embedder>,
+    reranker: Option<&dyn Reranker>,
     searches: &[TypedQuery],
     options: &HybridOptions,
 ) -> Result<HybridResponse> {
@@ -484,8 +527,9 @@ pub fn structured_search(
 
     for search in searches {
         if search.query_type == QueryType::Lex {
-            let fts_results =
-                ranked_list(collections, |k, c| store.search_fts(&search.query, k, c))?;
+            let fts_results = ranked_list(collections, |k, c| {
+                store.search_fts_with(&search.query, k, c, options.term_match)
+            })?;
             if !fts_results.is_empty() {
                 lists.push(fts_results);
             }
@@ -496,6 +540,7 @@ pub fn structured_search(
         .iter()
         .filter(|s| matches!(s.query_type, QueryType::Vec | QueryType::Hyde))
         .collect();
+    let mut rerank_embedding: Option<Vec<f32>> = None;
     if !vec_searches.is_empty() && store.vec_table_exists()? {
         if let Some(embedder) = embedder {
             let texts: Vec<String> = vec_searches
@@ -503,7 +548,7 @@ pub fn structured_search(
                 .map(|s| format_query_for_embedding(&s.query, embedder.model_uri()))
                 .collect();
             report.queries_embedded = texts.len();
-            let embeddings = embedder.embed_batch(&texts)?;
+            let mut embeddings = embedder.embed_batch(&texts)?;
             for embedding in embeddings.iter().flatten() {
                 let vec_results =
                     ranked_list(collections, |k, c| store.search_vec(embedding, k, c))?;
@@ -511,6 +556,11 @@ pub fn structured_search(
                     lists.push(vec_results);
                 }
             }
+            let first_vec = vec_searches
+                .iter()
+                .position(|s| s.query_type == QueryType::Vec)
+                .unwrap_or(0);
+            rerank_embedding = embeddings.get_mut(first_vec).and_then(Option::take);
         } else {
             report.vector_skipped = true;
         }
@@ -530,22 +580,51 @@ pub fn structured_search(
         .query
         .clone();
 
-    let results = finalize_candidates(store, fused, &primary_query, options)?;
+    let rerank_query = searches
+        .iter()
+        .find(|s| s.query_type == QueryType::Vec)
+        .map_or(primary_query.as_str(), |s| s.query.as_str());
+    let rerank = reranker.map(|r| RerankInput {
+        reranker: r,
+        query: rerank_query,
+        embedding: rerank_embedding.as_deref(),
+    });
+    let results = finalize_candidates(store, fused, &primary_query, rerank, options, &mut report)?;
     Ok(HybridResponse { results, report })
 }
 
+/// What the rerank step reads: the model, the query it is asked, and that
+/// query's embedding when one was made (for [`RerankChunk::Nearest`]).
+#[derive(Clone, Copy)]
+struct RerankInput<'a> {
+    reranker: &'a dyn Reranker,
+    query: &'a str,
+    embedding: Option<&'a [f32]>,
+}
+
 /// Steps shared by both pipelines: slice to `candidate_limit`, chunk each
-/// candidate and pick the best chunk by keyword overlap (intent terms at
-/// [`INTENT_WEIGHT_CHUNK`]), score `1/rrf_rank`, filter by `min_score`,
+/// candidate with its collection's geometry and pick the best chunk by
+/// keyword overlap (intent terms at [`INTENT_WEIGHT_CHUNK`]), score — `1/rrf_rank`, or
+/// with a reranker the [`blend`] of that rank and the best rerank score among
+/// the [`RerankChunk`] chunks, reordered — then filter by `min_score` and
 /// slice to `limit`. Fused results are already unique per file.
 fn finalize_candidates(
     store: &Store,
     fused: Vec<SearchResult>,
     primary_query: &str,
+    rerank: Option<RerankInput<'_>>,
     options: &HybridOptions,
+    report: &mut HybridReport,
 ) -> Result<Vec<HybridResult>> {
     let mut candidates = fused;
     candidates.truncate(options.candidate_limit);
+    if rerank.is_none() {
+        let ranks_kept = candidates
+            .len()
+            .min(options.limit)
+            .min(rank_floor(options.min_score));
+        candidates.truncate(ranks_kept);
+    }
 
     let query_terms: Vec<String> = primary_query
         .to_lowercase()
@@ -559,14 +638,21 @@ fn finalize_candidates(
         .map(extract_intent_terms)
         .unwrap_or_default();
 
-    let mut results = Vec::new();
-    for (i, cand) in candidates.into_iter().enumerate() {
-        let rrf_score = 1.0 / (i as f64 + 1.0);
-        if rrf_score < options.min_score {
-            break;
-        }
+    let nearest = match (rerank.and_then(|r| r.embedding), options.rerank_chunk) {
+        (Some(embedding), RerankChunk::Nearest) => Some((embedding, 1)),
+        (Some(embedding), RerankChunk::BestOfNearest(n)) => Some((embedding, n.max(1))),
+        _ => None,
+    };
 
-        let chunks = chunk_document_default(&cand.body);
+    let mut geometry = HashMap::new();
+    let mut results = Vec::with_capacity(candidates.len());
+    let mut rerank_chunks: Vec<Vec<Chunk>> = Vec::new();
+    for (i, cand) in candidates.into_iter().enumerate() {
+        if !geometry.contains_key(&cand.collection_name) {
+            let params = store.collection_chunk_params(&cand.collection_name)?;
+            geometry.insert(cand.collection_name.clone(), params);
+        }
+        let chunks = chunk_document_for(&cand.body, &geometry[&cand.collection_name]);
         let (best_chunk, best_chunk_pos) = if chunks.is_empty() {
             (cand.body.clone(), 0)
         } else {
@@ -591,22 +677,89 @@ fn finalize_candidates(
             (chunks[best_idx].text.clone(), chunks[best_idx].pos)
         };
 
+        if rerank.is_some() {
+            let mut offered = Vec::new();
+            if let Some((embedding, n)) = nearest {
+                let positions: Vec<usize> = store
+                    .chunk_distances(&cand.hash, embedding)?
+                    .into_iter()
+                    .take(n)
+                    .map(|(pos, _)| pos)
+                    .collect();
+                if !positions.is_empty() {
+                    let params = store.vector_chunk_params(&cand.hash)?;
+                    offered = token_chunks_at(&cand.body, &params, &positions);
+                }
+            }
+            if offered.is_empty() {
+                offered.push(Chunk {
+                    text: best_chunk.clone(),
+                    pos: best_chunk_pos,
+                });
+            }
+            rerank_chunks.push(offered);
+        }
+
         results.push(HybridResult {
-            context: store.context_for_file(&cand.filepath)?,
+            context: None,
             filepath: cand.filepath,
             display_path: cand.display_path,
             title: cand.title,
             body: cand.body,
             best_chunk,
             best_chunk_pos,
-            score: rrf_score,
+            score: 1.0 / (i as f64 + 1.0),
+            rrf_rank: i + 1,
+            rerank_score: None,
             docid: cand.docid,
         });
-        if results.len() == options.limit {
-            break;
+    }
+
+    if let Some(rerank) = rerank
+        && !results.is_empty()
+    {
+        let texts: Vec<String> = rerank_chunks
+            .iter()
+            .flatten()
+            .map(|c| c.text.clone())
+            .collect();
+        let (scores, fresh) = rerank_cached(store, rerank.reranker, rerank.query, &texts)?;
+        report.reranked = results.len();
+        report.rerank_fresh = fresh;
+        let mut scores = scores.into_iter();
+        for (i, (result, offered)) in results.iter_mut().zip(rerank_chunks).enumerate() {
+            let mut best: Option<(f64, Chunk)> = None;
+            for (chunk, score) in offered.into_iter().zip(scores.by_ref()) {
+                if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                    best = Some((score, chunk));
+                }
+            }
+            let (rerank_score, chunk) = best.expect("every result offers a chunk");
+            result.best_chunk = chunk.text;
+            result.best_chunk_pos = chunk.pos;
+            result.rerank_score = Some(rerank_score);
+            result.score = blend(i + 1, rerank_score);
         }
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        results.retain(|r| r.score >= options.min_score);
+        results.truncate(options.limit);
+    }
+
+    for result in &mut results {
+        result.context = store.context_for_file(&result.filepath)?;
     }
     Ok(results)
+}
+
+/// How many fused ranks can clear `min_score` when the score is `1/rank`.
+fn rank_floor(min_score: f64) -> usize {
+    if min_score <= 0.0 {
+        usize::MAX
+    } else {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ranks = (1.0 / min_score).floor() as usize;
+        ranks
+    }
 }
 
 #[cfg(test)]

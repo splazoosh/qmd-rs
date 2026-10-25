@@ -227,6 +227,7 @@ struct SearchOptions {
 }
 
 fn main() {
+    quiet_on_closed_stdout();
     qmd::store::enable_production_mode();
     let cli = Cli::parse();
     let location = commands::IndexLocation::resolve(cli.index.as_deref());
@@ -314,6 +315,34 @@ fn main() {
         let code = e.downcast_ref::<Exit>().map_or(1, |exit| exit.code);
         std::process::exit(code);
     }
+}
+
+/// Ends the process with status 0, and no panic message, when `println!`
+/// panics because the reader of stdout has gone (`qmd status | head`); any
+/// other panic goes to the default hook.
+fn quiet_on_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.payload().downcast_ref::<String>();
+        if message.is_some_and(|m| is_closed_stdout(m)) {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
+}
+
+/// Whether a panic message is std's "failed printing to stdout" for a broken
+/// pipe. The OS text is localised on Windows; the trailing os error code is not.
+fn is_closed_stdout(message: &str) -> bool {
+    let Some(error) = message.strip_prefix("failed printing to stdout: ") else {
+        return false;
+    };
+    error
+        .rsplit_once("(os error ")
+        .and_then(|(_, code)| code.strip_suffix(')')?.parse().ok())
+        .is_some_and(|code| {
+            std::io::Error::from_raw_os_error(code).kind() == std::io::ErrorKind::BrokenPipe
+        })
 }
 
 /// An error that ends the process with its own exit code rather than 1, for

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- `qmd` exits quietly with status 0 when the reader of its output goes away
+  (`qmd status | head`), instead of panicking in `println!`.
+- Two changes shipped in 0.2.0 that its notes left out:
+  - The `qmd/prebuilt-ggml` feature links a static CUDA ggml found under
+    `CMAKE_PREFIX_PATH` instead of building ggml (README, Build).
+  - CI builds and tests on Linux and Windows (CPU build); the lint job runs
+    beside it.
+
 ## 0.2.0
 
 - **Default changed:** BM25 terms now match if any is present (`--match any`);

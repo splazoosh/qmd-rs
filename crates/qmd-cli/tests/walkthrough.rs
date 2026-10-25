@@ -6,19 +6,23 @@
 //! so this runs in plain `cargo test` with no downloads.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
-fn qmd(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_qmd"))
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qmd"));
+    command
         .args(args)
         .current_dir(dir)
         .env("QMD_MOCK_EMBEDDER", "1")
         .env_remove("INDEX_PATH")
         .env("QMD_CONFIG_DIR", dir.join("config-unused"))
         .env("XDG_CACHE_HOME", dir.join("cache-unused"))
-        .env_remove("QMD_EMBED_MODEL")
-        .output()
-        .expect("qmd binary runs")
+        .env_remove("QMD_EMBED_MODEL");
+    command
+}
+
+fn qmd(dir: &Path, args: &[&str]) -> Output {
+    command(dir, args).output().expect("qmd binary runs")
 }
 
 fn ok(dir: &Path, args: &[&str]) -> String {
@@ -199,4 +203,21 @@ fn init_refuses_home_directory() {
         stderr.contains("Refusing to initialize a local index in $HOME"),
         "{stderr}"
     );
+}
+
+#[test]
+fn closed_stdout_exits_quietly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ok(dir, &["init"]);
+    let mut child = command(dir, &["status"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("qmd binary runs");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{:?}\nstderr: {stderr}", out.status);
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }

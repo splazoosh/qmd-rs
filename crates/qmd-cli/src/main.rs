@@ -40,6 +40,14 @@ enum Command {
         #[command(subcommand)]
         command: CollectionCommand,
     },
+    /// Describe what a collection or folder holds. Search results and `get`
+    /// carry the context of every prefix above a document, global first.
+    /// Unlike TS qmd, a prefix covers whole path segments only (/docs covers
+    /// /docs/a.md, not /docs-old/a.md)
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
     /// Mirror one document with its provenance, or check one already held.
     /// Re-running against an archived URL compares rather than overwrites.
     Archive {
@@ -113,6 +121,10 @@ enum Command {
         /// Restrict to one collection
         #[arg(short = 'c', long = "collection")]
         collection: Option<String>,
+        /// Start no new work after this many minutes, leaving the rest for
+        /// the next run (0: no cap)
+        #[arg(long, value_name = "MINUTES", default_value_t = 30)]
+        max_duration: u64,
     },
     /// Download the models needed by the active configuration
     Pull {
@@ -181,6 +193,30 @@ enum ArchiveCommand {
     },
     /// Register the archive as a collection so its extracts are searchable
     Index,
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    /// Set the context for a path: `qmd context add [PATH] TEXT`. PATH is
+    /// `/` for the global context, qmd://<collection>/<path>, or a directory
+    /// inside a collection; without it, the current directory
+    Add {
+        /// PATH then TEXT, or TEXT alone; words after PATH are joined with
+        /// spaces
+        #[arg(required = true, num_args = 1.., value_name = "PATH] [TEXT")]
+        args: Vec<String>,
+    },
+    /// List every context
+    List,
+    /// Remove the context set for a path (`/` for the global one)
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// `/`, qmd://<collection>/<path>, or a directory inside a collection
+        path: String,
+    },
+    /// List collections with no context, and the top-level directories of
+    /// collections with some that none covers (not a TS qmd command)
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -324,6 +360,16 @@ fn main() {
                 commands::collection_include(&location, &name, false)
             }
         },
+        Command::Context { command } => match command {
+            ContextCommand::Add { args } => match args.as_slice() {
+                [text] => commands::context_add(&location, None, text),
+                [path, text @ ..] => commands::context_add(&location, Some(path), &text.join(" ")),
+                [] => unreachable!("clap requires at least one argument"),
+            },
+            ContextCommand::List => commands::context_list(&location),
+            ContextCommand::Rm { path } => commands::context_remove(&location, &path),
+            ContextCommand::Check => commands::context_check(&location),
+        },
         Command::Cleanup { dry_run } => commands::cleanup(&location, dry_run),
         Command::Archive {
             command,
@@ -366,9 +412,17 @@ fn main() {
         }
         Command::Search { query, output } => commands::search(&location, &query, &output),
         Command::Vsearch { query, output } => commands::vsearch(&location, &query, &output),
-        Command::Embed { force, collection } => {
-            commands::embed(&location, force, collection.as_deref())
-        }
+        Command::Embed {
+            force,
+            collection,
+            max_duration,
+        } => commands::embed(
+            &location,
+            force,
+            collection.as_deref(),
+            (max_duration > 0)
+                .then(|| std::time::Duration::from_secs(max_duration.saturating_mul(60))),
+        ),
         Command::Pull { refresh } => commands::pull(&location, refresh),
         Command::Get {
             file,
@@ -432,6 +486,9 @@ impl Command {
                 command,
                 CollectionCommand::List | CollectionCommand::Show { .. }
             ),
+            Command::Context { command } => {
+                matches!(command, ContextCommand::List | ContextCommand::Check)
+            }
             Command::Cleanup { dry_run } => *dry_run,
             Command::Archive { command, .. } => matches!(
                 command,

@@ -129,8 +129,17 @@ async fn query_returns_ranked_rows_as_structured_content() {
         json!({ "searches": [{ "type": "lex", "query": "sourdough starter" }] }),
     )
     .await;
+    let text = text_of(&typed);
     let rows = typed.structured_content.expect("structured content");
     assert_eq!(rows["results"][0]["file"], "notes/sub/bread.md");
+    assert_eq!(
+        rows["results"][0]["context"],
+        "A test corpus.\n\nbaking notes"
+    );
+    assert!(
+        text.contains("notes/sub/bread.md (") && text.contains("Context: A test corpus."),
+        "{text}"
+    );
 
     let scoped = call(
         &client,

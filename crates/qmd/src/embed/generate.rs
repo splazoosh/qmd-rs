@@ -1,10 +1,18 @@
 //! Embedding generation driver, ported from TS `generateEmbeddings`.
 //!
-//! Simpler than the original: no LLM session timeout and no >80% error-rate
-//! abort; the per-chunk fallback and bounded retry of failed chunks are kept.
+//! Kept from TS: outer batches bounded by document count and bytes, a
+//! per-chunk fallback when a whole embedding call fails, up to three attempts
+//! per chunk, an abort above an 80 % error rate, a cap on the run's duration,
+//! and removal of partial chunk sets. Differences: failed chunks are retried
+//! at the end of their outer batch rather than after every 64 successes (an
+//! outer batch holds at most 64 documents, so the distance is similar); the
+//! dimension probe embeds a fixed text, so a bad first chunk cannot end the
+//! run; a document that fails to chunk is a failure, not an error; and the
+//! run first deletes vectors no active document uses, which TS leaves to
+//! `cleanup`.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::chunk::chunk_document_by_tokens_for;
 use crate::embed::{EmbeddingBackend, embedding_fingerprint_for, format_doc_for_embedding};
@@ -15,10 +23,18 @@ use crate::store::{Store, extract_title, now_iso};
 pub const DEFAULT_EMBED_MAX_DOCS_PER_BATCH: usize = 64;
 /// Byte budget per outer batch.
 pub const DEFAULT_EMBED_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// TS qmd's cap on one embed run. [`EmbedOptions::max_duration`] defaults to
+/// no cap; the CLI applies this one.
+pub const DEFAULT_EMBED_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 /// Chunks per embedding call.
 const BATCH_SIZE: usize = 32;
 /// Give up on a chunk after this many attempts.
 const MAX_RETRY_ATTEMPTS: u32 = 3;
+/// Stop once more than this share of attempted chunks has failed, judged
+/// after at least [`BATCH_SIZE`] attempts.
+const MAX_ERROR_RATE: f64 = 0.8;
+/// Text embedded once per run to learn the model's dimensionality.
+const DIMENSION_PROBE: &str = "dimension probe";
 
 /// Options for [`generate_embeddings`].
 #[derive(Default)]
@@ -31,6 +47,9 @@ pub struct EmbedOptions<'a> {
     pub collection: Option<String>,
     pub max_docs_per_batch: Option<usize>,
     pub max_batch_bytes: Option<u64>,
+    /// Start no new embedding call after this long; the documents left stay
+    /// pending for the next run. `None` sets no cap.
+    pub max_duration: Option<Duration>,
     /// Progress callback, invoked after every embedding sub-batch.
     #[allow(clippy::type_complexity)]
     pub on_progress: Option<Box<dyn Fn(&EmbedProgress) + 'a>>,
@@ -45,7 +64,8 @@ pub struct EmbedProgress {
     pub errors: usize,
 }
 
-/// A chunk that could not be embedded.
+/// A chunk that could not be embedded, or a document that could not be
+/// chunked (`seq` 0).
 #[derive(Debug, Clone)]
 pub struct EmbedFailure {
     pub path: String,
@@ -53,6 +73,15 @@ pub struct EmbedFailure {
     pub seq: usize,
     pub attempts: u32,
     pub reason: String,
+}
+
+/// Why a run stopped before every pending document was tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedStop {
+    /// More than 80 % of the attempted chunks failed.
+    ErrorRate { failed: usize, attempted: usize },
+    /// [`EmbedOptions::max_duration`] ran out.
+    TimeLimit(Duration),
 }
 
 /// Outcome of an embedding run.
@@ -63,6 +92,10 @@ pub struct EmbedResult {
     pub errors: usize,
     pub failures: Vec<EmbedFailure>,
     pub duration_ms: u128,
+    /// Vectors of content no active document holds, deleted before embedding.
+    pub orphans_removed: usize,
+    /// Set when the run stopped early; what it did not reach stays pending.
+    pub stopped: Option<EmbedStop>,
 }
 
 struct ChunkItem {
@@ -76,11 +109,27 @@ struct ChunkItem {
     fingerprint: String,
 }
 
+type Failures = HashMap<(String, usize), EmbedFailure>;
+
+fn record_failure(failures: &mut Failures, path: &str, hash: &str, seq: usize, reason: &str) {
+    let entry = failures
+        .entry((hash.to_owned(), seq))
+        .or_insert_with(|| EmbedFailure {
+            path: path.to_owned(),
+            hash: hash.to_owned(),
+            seq,
+            attempts: 0,
+            reason: String::new(),
+        });
+    entry.attempts += 1;
+    entry.reason = reason.chars().take(180).collect();
+}
+
 /// Generate vector embeddings for all documents that need them.
 ///
 /// # Errors
-/// Fails on store errors or unrecoverable backend failures (per-chunk
-/// failures are recorded in the result instead).
+/// Fails on store errors and when the backend cannot embed the dimension
+/// probe; a chunk that fails is recorded in the result instead.
 pub fn generate_embeddings(
     store: &Store,
     backend: &dyn EmbeddingBackend,
@@ -104,10 +153,14 @@ pub fn generate_embeddings(
     if options.force {
         store.clear_all_embeddings(options.collection.as_deref())?;
     }
+    let orphans_removed = store.delete_orphaned_vectors()?;
 
     let docs_to_embed = store.pending_embedding_docs(options.collection.as_deref(), &model)?;
     if docs_to_embed.is_empty() {
-        return Ok(EmbedResult::default());
+        return Ok(EmbedResult {
+            orphans_removed,
+            ..EmbedResult::default()
+        });
     }
     let docs_total = docs_to_embed.len();
 
@@ -130,11 +183,29 @@ pub fn generate_embeddings(
     }
 
     let mut chunks_embedded = 0usize;
+    let mut chunks_discarded = 0usize;
     let mut total_chunks = 0usize;
     let mut vector_table_initialized = false;
-    let mut failures: HashMap<(String, usize), EmbedFailure> = HashMap::new();
+    let mut failures: Failures = HashMap::new();
+    let mut stopped: Option<EmbedStop> = None;
+    let stop_reason = |succeeded: usize, failures: &Failures| {
+        if let Some(limit) = options.max_duration
+            && started.elapsed() >= limit
+        {
+            return Some(EmbedStop::TimeLimit(limit));
+        }
+        let failed = failures.len();
+        let attempted = succeeded + failed;
+        #[allow(clippy::cast_precision_loss)]
+        let too_many = attempted >= BATCH_SIZE && failed as f64 > attempted as f64 * MAX_ERROR_RATE;
+        too_many.then_some(EmbedStop::ErrorRate { failed, attempted })
+    };
 
     for batch in batches {
+        stopped = stop_reason(chunks_embedded + chunks_discarded, &failures);
+        if stopped.is_some() {
+            break;
+        }
         let hashes: Vec<String> = batch.iter().map(|d| d.hash.clone()).collect();
         let bodies = store.content_bodies(&hashes)?;
 
@@ -148,7 +219,14 @@ pub fn generate_embeddings(
                 continue;
             }
             let title = extract_title(body, &doc.path);
-            let chunks = chunk_document_by_tokens_for(body, backend, &doc.chunk)?;
+            let chunks = match chunk_document_by_tokens_for(body, backend, &doc.chunk) {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    let reason = format!("chunking failed: {e}");
+                    record_failure(&mut failures, &doc.path, &doc.hash, 0, &reason);
+                    continue;
+                }
+            };
             let fingerprint = embedding_fingerprint_for(&model, &doc.chunk);
             store.clear_hash_embeddings(&doc.hash)?;
             let expected = chunks.len();
@@ -172,11 +250,10 @@ pub fn generate_embeddings(
         }
 
         if !vector_table_initialized {
-            let first = &batch_chunks[0];
-            let text = format_doc_for_embedding(&first.text, Some(&first.title), &model);
+            let text = format_doc_for_embedding(DIMENSION_PROBE, None, &model);
             let probe = backend.embed(&text)?.ok_or_else(|| {
                 crate::error::Error::Other(
-                    "failed to get embedding dimensions from first chunk".to_owned(),
+                    "the embedder returned no vector for the dimension probe".to_owned(),
                 )
             })?;
             store.ensure_vec_table(probe.len())?;
@@ -186,7 +263,7 @@ pub fn generate_embeddings(
         let insert_chunk = |chunk: &ChunkItem,
                             embedding: &[f32],
                             chunks_embedded: &mut usize,
-                            failures: &mut HashMap<(String, usize), EmbedFailure>|
+                            failures: &mut Failures|
          -> Result<()> {
             #[allow(clippy::cast_possible_wrap)]
             store.insert_embedding(
@@ -203,23 +280,15 @@ pub fn generate_embeddings(
             failures.remove(&(chunk.hash.clone(), chunk.seq));
             Ok(())
         };
-        let record_failure = |failures: &mut HashMap<(String, usize), EmbedFailure>,
-                              chunk: &ChunkItem,
-                              reason: &str| {
-            let entry = failures
-                .entry((chunk.hash.clone(), chunk.seq))
-                .or_insert_with(|| EmbedFailure {
-                    path: chunk.path.clone(),
-                    hash: chunk.hash.clone(),
-                    seq: chunk.seq,
-                    attempts: 0,
-                    reason: String::new(),
-                });
-            entry.attempts += 1;
-            entry.reason = reason.chars().take(180).collect();
+        let chunk_failed = |failures: &mut Failures, chunk: &ChunkItem, reason: &str| {
+            record_failure(failures, &chunk.path, &chunk.hash, chunk.seq, reason);
         };
 
         for chunk_batch in batch_chunks.chunks(BATCH_SIZE) {
+            stopped = stop_reason(chunks_embedded + chunks_discarded, &failures);
+            if stopped.is_some() {
+                break;
+            }
             let texts: Vec<String> = chunk_batch
                 .iter()
                 .map(|c| format_doc_for_embedding(&c.text, Some(&c.title), &model))
@@ -232,7 +301,7 @@ pub fn generate_embeddings(
                             Some(v) => {
                                 insert_chunk(chunk, &v, &mut chunks_embedded, &mut failures)?
                             }
-                            None => record_failure(
+                            None => chunk_failed(
                                 &mut failures,
                                 chunk,
                                 "batch embedding returned no vector",
@@ -248,14 +317,14 @@ pub fn generate_embeddings(
                             Ok(Some(v)) => {
                                 insert_chunk(chunk, &v, &mut chunks_embedded, &mut failures)?
                             }
-                            Ok(None) => record_failure(
+                            Ok(None) => chunk_failed(
                                 &mut failures,
                                 chunk,
                                 &format!(
                                     "batch failed: {batch_err}; single embed returned no vector"
                                 ),
                             ),
-                            Err(e) => record_failure(&mut failures, chunk, &e.to_string()),
+                            Err(e) => chunk_failed(&mut failures, chunk, &e.to_string()),
                         }
                     }
                 }
@@ -271,7 +340,7 @@ pub fn generate_embeddings(
             }
         }
 
-        let mut retried = true;
+        let mut retried = stopped.is_none();
         while retried {
             retried = false;
             let retry_keys: Vec<(String, usize)> = failures
@@ -290,16 +359,19 @@ pub fn generate_embeddings(
                 let text = format_doc_for_embedding(&chunk.text, Some(&chunk.title), &model);
                 match backend.embed(&text) {
                     Ok(Some(v)) => insert_chunk(chunk, &v, &mut chunks_embedded, &mut failures)?,
-                    Ok(None) => {
-                        record_failure(&mut failures, chunk, "embedding returned no vector")
-                    }
-                    Err(e) => record_failure(&mut failures, chunk, &e.to_string()),
+                    Ok(None) => chunk_failed(&mut failures, chunk, "embedding returned no vector"),
+                    Err(e) => chunk_failed(&mut failures, chunk, &e.to_string()),
                 }
             }
         }
 
         let removed = store.remove_incomplete_embeddings(&expected_chunks_by_hash, &model)?;
-        chunks_embedded = chunks_embedded.saturating_sub(removed);
+        let removed = removed.min(chunks_embedded);
+        chunks_embedded -= removed;
+        chunks_discarded += removed;
+        if stopped.is_some() {
+            break;
+        }
     }
 
     let mut failure_list: Vec<EmbedFailure> = failures.into_values().collect();
@@ -310,5 +382,7 @@ pub fn generate_embeddings(
         errors: failure_list.len(),
         failures: failure_list,
         duration_ms: started.elapsed().as_millis(),
+        orphans_removed,
+        stopped,
     })
 }

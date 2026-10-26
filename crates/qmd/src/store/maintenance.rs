@@ -51,26 +51,7 @@ impl Store {
     pub fn cleanup(&self) -> Result<CleanupStats> {
         let tx = self.conn().unchecked_transaction()?;
         let cached_scores = tx.execute("DELETE FROM llm_cache", [])?;
-
-        let orphans: Vec<(String, i64)> = {
-            let mut stmt = tx.prepare(&format!("SELECT cv.hash, cv.seq {ORPHANED_VECTORS}"))?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        if !orphans.is_empty() {
-            if self.vec_table_exists()? {
-                let mut del = tx.prepare("DELETE FROM vectors_vec WHERE hash_seq = ?1")?;
-                for (hash, seq) in &orphans {
-                    del.execute(params![format!("{hash}_{seq}")])?;
-                }
-            }
-            tx.execute(
-                "DELETE FROM content_vectors WHERE NOT EXISTS (SELECT 1 FROM documents d
-                   WHERE d.hash = content_vectors.hash AND d.active = 1)",
-                [],
-            )?;
-        }
-
+        let orphaned_vectors = self.delete_orphaned_vectors_in(&tx)?;
         let inactive_docs = tx.execute("DELETE FROM documents WHERE active = 0", [])?;
         let orphaned_content = tx.execute(
             "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)",
@@ -83,9 +64,45 @@ impl Store {
         )?;
         Ok(CleanupStats {
             cached_scores,
-            orphaned_vectors: orphans.len(),
+            orphaned_vectors,
             inactive_docs,
             orphaned_content,
         })
+    }
+
+    /// Delete the embedded chunks of content no active document holds: what
+    /// an edited document's old hash leaves behind. `embed` runs this, so
+    /// orphans do not build up between cleanups. Returns the chunks removed.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn delete_orphaned_vectors(&self) -> Result<usize> {
+        let tx = self.conn().unchecked_transaction()?;
+        let removed = self.delete_orphaned_vectors_in(&tx)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    fn delete_orphaned_vectors_in(&self, tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+        let orphans: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(&format!("SELECT cv.hash, cv.seq {ORPHANED_VECTORS}"))?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        if self.vec_table_exists()? {
+            let mut del = tx.prepare("DELETE FROM vectors_vec WHERE hash_seq = ?1")?;
+            for (hash, seq) in &orphans {
+                del.execute(params![format!("{hash}_{seq}")])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM content_vectors WHERE NOT EXISTS (SELECT 1 FROM documents d
+               WHERE d.hash = content_vectors.hash AND d.active = 1)",
+            [],
+        )?;
+        Ok(orphans.len())
     }
 }

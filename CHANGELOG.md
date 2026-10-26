@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.0
+
+- New `qmd context` commands: `context add [PATH] TEXT`, `context list`,
+  `context rm PATH` and `context check`. PATH is `/` for the global context,
+  `qmd://<collection>/<path>`, or a directory inside a collection; a
+  directory two collections share is refused rather than guessed. A prefix
+  covers whole path segments only (`/docs` covers `/docs/a.md`, not
+  `/docs-old/a.md`). `context check` lists collections with no context and
+  the top-level directories none covers. `context list` and `context check`
+  are read-only commands for the closed-stdout exit status.
+- Search results, `get` and the MCP `query` and `get` tools carry the
+  context of every prefix above a document, global first; the MCP `query`
+  text summary prints it as a `Context:` line.
+- `embed --max-duration <MINUTES>` (default 30, `0` for no cap): `embed`
+  starts no new work past the cap and reports how many documents still need
+  embedding, for the next run to finish.
+- `embed` retries a failed embedding call chunk by chunk, up to three
+  attempts per chunk, and stops once more than 80 % of attempted chunks have
+  failed. A document that fails to chunk is reported and skipped instead of
+  ending the run.
+- `embed` first deletes vectors no active document uses, so an edited
+  document's old vectors no longer wait for `cleanup`.
+- The config file is saved atomically: a failed save leaves `index.yml` as
+  it was instead of truncated. The save writes through a symlink rather than
+  replacing it, keeps the file's permissions, and names the file in its
+  error with the I/O cause.
+- On Windows, a collection's `update` command that begins with a double
+  quote (`"my tool.exe" sync`) now runs; 0.3.1 still dropped that leading
+  quote.
+- When `collection rename` cannot save the config and cannot undo the index
+  rename either, the error now names both failures and their causes, and
+  says that the index and the config disagree.
+
 ## 0.3.1
 
 - On Windows, a collection's `update` command keeps its double quotes:

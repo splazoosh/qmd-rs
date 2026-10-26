@@ -295,6 +295,9 @@ fn summarize(hits: &[QueryHit], traces: &[Option<String>], display_query: &str) 
     let mut out = format!("{} results for: {display_query}\n", hits.len());
     for (h, trace) in hits.iter().zip(traces) {
         out.push_str(&format!("\n{} {} ({:.2})\n", h.docid, h.file, h.score));
+        if let Some(context) = &h.context {
+            out.push_str(&format!("Context: {context}\n"));
+        }
         if let Some(trace) = trace {
             out.push_str(&format!("Explain:\n{trace}\n"));
         }

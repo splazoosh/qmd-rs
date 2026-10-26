@@ -12,6 +12,13 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    #[error("failed to save {}", path.display())]
+    Save {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Default DB path requested outside production mode (test safety rail,
     /// ported from the TS implementation).
     #[error(

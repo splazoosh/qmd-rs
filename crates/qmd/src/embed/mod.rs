@@ -7,7 +7,10 @@ mod generate;
 #[cfg(feature = "llama")]
 mod llama;
 
-pub use generate::{EmbedFailure, EmbedOptions, EmbedProgress, EmbedResult, generate_embeddings};
+pub use generate::{
+    DEFAULT_EMBED_MAX_DURATION, EmbedFailure, EmbedOptions, EmbedProgress, EmbedResult, EmbedStop,
+    generate_embeddings,
+};
 #[cfg(feature = "llama")]
 pub(crate) use llama::backend as llama_backend;
 #[cfg(feature = "llama")]

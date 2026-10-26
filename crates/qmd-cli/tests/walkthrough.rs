@@ -243,7 +243,13 @@ fn closed_stdout_exits_141_for_a_state_changing_command() {
 
 /// A local index over `docs/` with three documents, embedded by the mock.
 fn embedded_corpus(dir: &Path) {
-    ok(dir, &["init"]);
+    embedded_corpus_with(dir, |args| {
+        ok(dir, args);
+    });
+}
+
+fn embedded_corpus_with(dir: &Path, ok: impl Fn(&[&str])) {
+    ok(&["init"]);
     let docs = dir.join("docs");
     std::fs::create_dir_all(&docs).unwrap();
     std::fs::write(
@@ -257,8 +263,8 @@ fn embedded_corpus(dir: &Path) {
     )
     .unwrap();
     std::fs::write(docs.join("tea.md"), "# Brewing Tea\n\nSteep green tea.\n").unwrap();
-    ok(dir, &["collection", "add", "docs", "--name", "docs"]);
-    ok(dir, &["embed"]);
+    ok(&["collection", "add", "docs", "--name", "docs"]);
+    ok(&["embed"]);
 }
 
 #[test]
@@ -361,26 +367,138 @@ fn collection_rename_moves_documents_without_reindexing() {
 fn collection_rename_leaves_the_index_untouched_when_the_config_cannot_be_saved() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    embedded_corpus(dir);
-    let config = dir.join(".qmd").join("index.yml");
-    let set_readonly = |readonly| {
-        let mut perms = std::fs::metadata(&config).unwrap().permissions();
-        perms.set_readonly(readonly);
-        std::fs::set_permissions(&config, perms).unwrap();
+    let db = dir.join("db").join("index.sqlite");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let run = |args: &[&str]| command(dir, args).env("INDEX_PATH", &db).output().unwrap();
+    let ok = |args: &[&str]| {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "qmd {args:?} failed\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    embedded_corpus_with(dir, |args| {
+        ok(args);
+    });
+
+    #[cfg(windows)]
+    let target = dir.join(".qmd").join("index.yml");
+    #[cfg(not(windows))]
+    let target = dir.join(".qmd");
+    let set_blocked = |blocked: bool| {
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        #[cfg(windows)]
+        perms.set_readonly(blocked);
+        #[cfg(not(windows))]
+        std::os::unix::fs::PermissionsExt::set_mode(
+            &mut perms,
+            if blocked { 0o555 } else { 0o755 },
+        );
+        std::fs::set_permissions(&target, perms).unwrap();
     };
 
-    set_readonly(true);
-    let out = qmd(dir, &["collection", "rename", "docs", "notes"]);
-    set_readonly(false);
+    set_blocked(true);
+    #[cfg(not(windows))]
+    if std::fs::write(target.join("probe"), "").is_ok() {
+        set_blocked(false);
+        eprintln!("skipped: running as a user that permissions do not stop");
+        return;
+    }
+    let out = run(&["collection", "rename", "docs", "notes"]);
+    set_blocked(false);
     assert!(!out.status.success());
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join(".qmd"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 
-    let out = ok(dir, &["update"]);
+    let out = ok(&["update"]);
     assert!(out.contains("0 new, 0 updated, 3 unchanged"), "{out}");
-    let out = ok(dir, &["ls"]);
+    let out = ok(&["ls"]);
     assert!(
         out.contains("qmd://docs/") && !out.contains("notes"),
         "{out}"
     );
+}
+
+#[test]
+fn context_commands_attach_context_to_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    embedded_corpus(dir);
+
+    assert!(ok(dir, &["context", "list"]).contains("No contexts"));
+    assert!(ok(dir, &["context", "check"]).contains("  qmd://docs/\n"));
+
+    ok(dir, &["context", "add", "/", "A test corpus."]);
+    let out = ok(
+        dir,
+        &["context", "add", "qmd://docs/", "Notes", "on", "things."],
+    );
+    assert!(out.contains("Set context for qmd://docs/"), "{out}");
+    let out = ok(dir, &["context", "add", "docs/sub", "Nested notes."]);
+    assert!(out.contains("Set context for qmd://docs/sub"), "{out}");
+    assert!(
+        !qmd(dir, &["context", "add", "qmd://missing/", "x"])
+            .status
+            .success()
+    );
+    assert!(
+        !qmd(dir, &["context", "add", "elsewhere", "x"])
+            .status
+            .success()
+    );
+
+    let out = ok(dir, &["context", "list"]);
+    assert!(
+        out.contains("/ (global)\n  A test corpus.")
+            && out.contains("qmd://docs/\n  Notes on things.")
+            && out.contains("qmd://docs/sub\n  Nested notes."),
+        "{out}"
+    );
+    assert!(ok(dir, &["context", "check"]).contains("Every collection has context"));
+
+    let out = ok(dir, &["query", "raft leader", "--format", "json"]);
+    let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(rows[0]["context"], "A test corpus.\n\nNotes on things.");
+    let out = ok(dir, &["get", "qmd://docs/raft.md"]);
+    assert!(out.contains("Folder Context: A test corpus."), "{out}");
+
+    ok(dir, &["context", "rm", "qmd://docs/sub"]);
+    assert!(
+        !qmd(dir, &["context", "rm", "qmd://docs/sub"])
+            .status
+            .success()
+    );
+    ok(dir, &["context", "rm", "/"]);
+    let out = ok(dir, &["query", "raft leader", "--format", "json"]);
+    let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(rows[0]["context"], "Notes on things.");
+    let config = std::fs::read_to_string(dir.join(".qmd").join("index.yml")).unwrap();
+    assert!(!config.contains("global_context"), "{config}");
+
+    std::fs::write(dir.join("docs/plain.txt"), "plain text").unwrap();
+    ok(
+        dir,
+        &[
+            "collection",
+            "add",
+            "docs",
+            "--name",
+            "text",
+            "--mask",
+            "**/*.txt",
+        ],
+    );
+    let out = qmd(dir, &["context", "add", "docs", "Shared folder."]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("docs, text"), "{stderr}");
+    ok(dir, &["context", "add", "qmd://text/", "Plain text."]);
 }
 
 #[test]
@@ -480,6 +598,25 @@ fn update_runs_a_local_update_command_only_when_trusted() {
         written.contains("a b") && !written.contains('\\'),
         "{written}"
     );
+
+    let tool_dir = dir.join("tool dir");
+    std::fs::create_dir_all(&tool_dir).unwrap();
+    let (script, body, program) = if cfg!(windows) {
+        ("say.bat", "@echo %~1>\"leading out.txt\"\r\n", "")
+    } else {
+        ("say.sh", "echo \"$1\" > \"leading out.txt\"\n", "sh ")
+    };
+    std::fs::write(tool_dir.join(script), body).unwrap();
+    let leading = format!("{program}\"{}\" \"c d\"", tool_dir.join(script).display());
+    ok(dir, &["collection", "update-cmd", "docs", &leading]);
+    let out = trusted(&["update"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read_to_string(dir.join("docs/leading out.txt")).unwrap();
+    assert!(written.contains("c d"), "{written}");
 
     ok(dir, &["collection", "update-cmd", "docs", "exit", "3"]);
     let out = trusted(&["update"]);

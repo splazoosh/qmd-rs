@@ -209,14 +209,57 @@ pub fn load_config(path: &Path) -> Result<CollectionConfig> {
 }
 
 /// Save configuration to a YAML file, creating parent directories as needed.
+/// The file is written beside the target and renamed over it, so a save that
+/// fails leaves the old file whole. A symlink is followed, and the old file's
+/// permissions are kept.
 pub fn save_config(path: &Path, config: &CollectionConfig) -> Result<()> {
+    let yaml = serde_yaml_ng::to_string(config)
+        .map_err(|e| Error::Config(format!("failed to serialize config: {e}")))?;
+    replace_file(path, yaml.as_bytes()).map_err(|source| Error::Save {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml_ng::to_string(config)
-        .map_err(|e| Error::Config(format!("failed to serialize config: {e}")))?;
-    std::fs::write(path, yaml)?;
-    Ok(())
+    let is_link = path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let target = if is_link {
+        std::fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let mut tmp_name = target.as_os_str().to_owned();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp_name);
+    let permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|m| m.permissions())
+        .filter(|p| cfg!(unix) || !p.readonly());
+    let written =
+        write_synced(&tmp, bytes, permissions).and_then(|()| std::fs::rename(&tmp, &target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_synced(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
+    }
+    file.sync_all()
 }
 
 impl CollectionConfig {
@@ -286,6 +329,39 @@ impl CollectionConfig {
         self.collections.shift_remove(name).is_some()
     }
 
+    /// Set the context for `prefix` in a collection, replacing any context
+    /// whose prefix normalizes the same. Returns false if the collection does
+    /// not exist.
+    pub fn add_context(&mut self, collection: &str, prefix: &str, text: &str) -> bool {
+        let Some(coll) = self.collections.get_mut(collection) else {
+            return false;
+        };
+        let prefix = normalize_context_prefix(prefix);
+        let map = coll.context.get_or_insert_with(ContextMap::new);
+        map.retain(|key, _| normalize_context_prefix(key) != prefix);
+        map.insert(prefix, text.to_owned());
+        true
+    }
+
+    /// Remove the context for `prefix` from a collection, dropping an emptied
+    /// map. Returns false if there was none.
+    pub fn remove_context(&mut self, collection: &str, prefix: &str) -> bool {
+        let Some(coll) = self.collections.get_mut(collection) else {
+            return false;
+        };
+        let Some(map) = coll.context.as_mut() else {
+            return false;
+        };
+        let prefix = normalize_context_prefix(prefix);
+        let before = map.len();
+        map.retain(|key, _| normalize_context_prefix(key) != prefix);
+        let removed = map.len() < before;
+        if map.is_empty() {
+            coll.context = None;
+        }
+        removed
+    }
+
     /// Rename a collection in place, keeping its position in the file.
     /// Returns false if `old` did not exist.
     pub fn rename_collection(&mut self, old: &str, new: &str) -> bool {
@@ -296,6 +372,15 @@ impl CollectionConfig {
             .shift_insert(index, new.to_owned(), collection);
         true
     }
+}
+
+/// The key a context is stored under: a leading `/`, no trailing `/` and
+/// forward slashes, so `docs\a`, `docs/a/` and `/docs/a` are one prefix and
+/// the collection root is `/`.
+pub fn normalize_context_prefix(prefix: &str) -> String {
+    let trimmed = prefix.replace('\\', "/");
+    let trimmed = trimmed.trim_matches('/');
+    format!("/{trimmed}")
 }
 
 /// Validate a collection name: alphanumeric, hyphens, underscores.
@@ -414,6 +499,96 @@ collections:
         let names: Vec<&str> = config.collections.keys().map(String::as_str).collect();
         assert_eq!(names, ["a", "z", "c"]);
         assert_eq!(config.get("z").unwrap().update.as_deref(), Some("git pull"));
+    }
+
+    #[test]
+    fn contexts_are_keyed_by_normalized_prefix() {
+        let mut config = CollectionConfig::default();
+        config.add_collection("a", "/a", "**/*.md", &[]);
+        assert!(config.add_context("a", "", "root"));
+        assert!(config.add_context("a", "docs/", "docs"));
+        assert!(config.add_context("a", "/docs", "docs, again"));
+        assert!(!config.add_context("missing", "/", "x"));
+        let map = config.get("a").unwrap().context.clone().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["/"], "root");
+        assert_eq!(map["/docs"], "docs, again");
+
+        assert!(config.remove_context("a", "docs"));
+        assert!(!config.remove_context("a", "docs"));
+        assert!(config.remove_context("a", "/"));
+        assert_eq!(config.get("a").unwrap().context, None);
+        assert_eq!(normalize_context_prefix(r"x\y\"), "/x/y");
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_whole_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.yml");
+        std::fs::write(&path, "x".repeat(10_000)).unwrap();
+        let mut config = CollectionConfig::default();
+        config.add_collection("a", "/a", "**/*.md", &[]);
+        save_config(&path, &config).unwrap();
+        assert_eq!(load_config(&path).unwrap(), config);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["index.yml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_writes_through_a_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.yml");
+        std::fs::write(&real, "").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("index.yml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut config = CollectionConfig::default();
+        config.add_collection("a", "/a", "**/*.md", &[]);
+        save_config(&link, &config).unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(load_config(&real).unwrap(), config);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_a_read_only_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.yml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        save_config(&path, &CollectionConfig::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_dangling_symlink_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("index.yml");
+        std::os::unix::fs::symlink(dir.path().join("missing.yml"), &link).unwrap();
+        let err = save_config(&link, &CollectionConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("index.yml"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_save_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.yml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "").unwrap();
+        let err = save_config(&path, &CollectionConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("index.yml"), "{err}");
+        assert!(std::error::Error::source(&err).is_some());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

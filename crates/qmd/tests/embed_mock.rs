@@ -4,8 +4,8 @@
 mod common;
 
 use qmd::embed::{
-    EmbedOptions, Embedder as _, MockEmbedder, embedding_fingerprint, format_doc_for_embedding,
-    generate_embeddings,
+    EmbedOptions, EmbedStop, Embedder as _, MockEmbedder, embedding_fingerprint,
+    format_doc_for_embedding, generate_embeddings,
 };
 use qmd::store::extract_title;
 
@@ -192,5 +192,206 @@ fn cleanup_removes_orphaned_vectors_and_leaves_nothing_to_re_embed() {
     assert_eq!(
         again.docs_processed, 0,
         "the active documents keep their vectors"
+    );
+}
+
+/// A backend whose batch calls always fail and whose single calls fail
+/// `fail_first` times for each text `fails` picks, then succeed.
+struct Flaky {
+    inner: MockEmbedder,
+    fails: fn(&str) -> bool,
+    fail_first: usize,
+    attempts: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+}
+
+impl Flaky {
+    fn new(fails: fn(&str) -> bool, fail_first: usize) -> Self {
+        Self {
+            inner: MockEmbedder::default(),
+            fails,
+            fail_first,
+            attempts: std::sync::Mutex::default(),
+        }
+    }
+
+    fn single_calls(&self) -> usize {
+        self.attempts.lock().unwrap().values().sum()
+    }
+}
+
+impl qmd::embed::Embedder for Flaky {
+    fn model_uri(&self) -> &str {
+        self.inner.model_uri()
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> qmd::Result<Vec<Option<Vec<f32>>>> {
+        if let [text] = texts {
+            if (self.fails)(text) {
+                let mut attempts = self.attempts.lock().unwrap();
+                let n = attempts.entry(text.clone()).or_default();
+                *n += 1;
+                if *n <= self.fail_first {
+                    return Err(qmd::Error::Other(format!("attempt {n} failed")));
+                }
+            }
+            return self.inner.embed_batch(texts);
+        }
+        Err(qmd::Error::Other("batch call failed".to_owned()))
+    }
+}
+
+impl qmd::chunk::Tokenizer for Flaky {
+    fn count_tokens(&self, text: &str) -> qmd::Result<usize> {
+        self.inner.count_tokens(text)
+    }
+
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> qmd::Result<String> {
+        self.inner.truncate_to_tokens(text, max_tokens)
+    }
+}
+
+fn pending(store: &qmd::Store) -> usize {
+    store
+        .pending_embedding_docs(None, MockEmbedder::default().model_uri())
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn a_failed_batch_falls_back_to_single_chunks_and_retries_each_up_to_three_times() {
+    let store = common::indexed_store();
+    let recovers = Flaky::new(|t| !t.contains("dimension probe"), 2);
+    let result = generate_embeddings(&store, &recovers, &EmbedOptions::default()).unwrap();
+    assert_eq!(result.errors, 0, "{:?}", result.failures);
+    assert!(result.stopped.is_none());
+    assert_eq!(pending(&store), 0);
+    assert_eq!(recovers.single_calls(), 3 * result.chunks_embedded);
+
+    let store = common::indexed_store();
+    let never = Flaky::new(|t| t.contains("Remote Work Policy"), usize::MAX);
+    let result = generate_embeddings(&store, &never, &EmbedOptions::default()).unwrap();
+    assert!(result.errors > 0);
+    assert!(
+        result
+            .failures
+            .iter()
+            .all(|f| f.path == "remote-work-policy.md" && f.attempts == 3),
+        "{:?}",
+        result.failures
+    );
+    assert!(result.stopped.is_none(), "one bad document is no abort");
+    assert_eq!(
+        pending(&store),
+        1,
+        "its partial set is removed, so it stays pending"
+    );
+}
+
+#[test]
+fn embedding_stops_once_most_chunks_fail_and_leaves_the_rest_pending() {
+    let store = qmd::Store::open_in_memory().unwrap();
+    let now = qmd::store::now_iso();
+    for i in 0..80 {
+        let body = format!("# Note {i}\n\nA short note numbered {i}.\n");
+        let hash = qmd::store::hash_content(&body);
+        store.insert_content(&hash, &body, &now).unwrap();
+        store
+            .insert_document("notes", &format!("n{i:02}.md"), "Note", &hash, &now, &now)
+            .unwrap();
+    }
+    let broken = Flaky::new(|t| t.contains("note numbered"), usize::MAX);
+    let result = generate_embeddings(&store, &broken, &EmbedOptions::default()).unwrap();
+    assert_eq!(
+        result.stopped,
+        Some(EmbedStop::ErrorRate {
+            failed: 32,
+            attempted: 32
+        })
+    );
+    assert_eq!(result.chunks_embedded, 0);
+    assert_eq!(broken.single_calls(), 32, "no retries once stopping");
+    assert_eq!(pending(&store), 80);
+}
+
+#[test]
+fn chunks_of_a_removed_partial_set_still_count_as_attempted_for_the_error_rate() {
+    let store = qmd::Store::open_in_memory().unwrap();
+    let now = qmd::store::now_iso();
+    let filler = "Plain words that embed without trouble. ".repeat(100);
+    for i in 0..40 {
+        let body = format!("# Doc {i}\n\npoisoned {i}\n\n{filler}\n\n{filler}\n\n{filler}\n");
+        let hash = qmd::store::hash_content(&body);
+        store.insert_content(&hash, &body, &now).unwrap();
+        store
+            .insert_document("docs", &format!("d{i:02}.md"), "Doc", &hash, &now, &now)
+            .unwrap();
+    }
+    let one_bad_chunk_each = Flaky::new(|t| t.contains("poisoned"), usize::MAX);
+    let options = EmbedOptions {
+        max_docs_per_batch: Some(4),
+        ..Default::default()
+    };
+    let result = generate_embeddings(&store, &one_bad_chunk_each, &options).unwrap();
+    assert_eq!(result.errors, 40, "{:?}", result.stopped);
+    assert!(
+        result.stopped.is_none(),
+        "one chunk in four failing is no abort"
+    );
+}
+
+#[test]
+fn embedding_stops_at_its_time_cap_and_resumes_on_the_next_run() {
+    let store = common::indexed_store();
+    let mock = MockEmbedder::default();
+    let capped = EmbedOptions {
+        max_duration: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
+    let result = generate_embeddings(&store, &mock, &capped).unwrap();
+    assert_eq!(
+        result.stopped,
+        Some(EmbedStop::TimeLimit(std::time::Duration::ZERO))
+    );
+    assert_eq!(result.chunks_embedded, 0);
+    assert_eq!(pending(&store), 6);
+
+    let result = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert!(result.stopped.is_none());
+    assert_eq!(pending(&store), 0);
+}
+
+#[test]
+fn embed_deletes_the_vectors_an_edited_document_leaves_behind() {
+    let store = common::indexed_store();
+    let mock = MockEmbedder::default();
+    generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+
+    let body = "# Remote Work Policy\n\nRewritten.\n";
+    let hash = qmd::store::hash_content(body);
+    store.insert_content(&hash, body, "2026-01-01").unwrap();
+    store
+        .conn()
+        .execute(
+            "UPDATE documents SET hash = ?1 WHERE path = 'remote-work-policy.md'",
+            [&hash],
+        )
+        .unwrap();
+    let orphaned = store.preview_cleanup().unwrap().orphaned_vectors;
+    assert!(orphaned > 0);
+
+    let result = generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    assert_eq!(result.orphans_removed, orphaned);
+    assert_eq!(result.docs_processed, 1);
+    assert_eq!(store.preview_cleanup().unwrap().orphaned_vectors, 0);
+    let count = |table: &str| -> i64 {
+        store
+            .conn()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("vectors_vec"),
+        count("content_vectors"),
+        "vec0 rows and their records leave together"
     );
 }

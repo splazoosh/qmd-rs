@@ -405,10 +405,14 @@ pub fn collection_rename(location: &IndexLocation, old: &str, new: &str) -> Resu
     let moved = app.store.rename_collection(old, new)?;
     app.config.rename_collection(old, new);
     if let Err(e) = config::save_config(&app.config_path, &app.config) {
-        app.store
-            .rename_collection(new, old)
-            .context("config save failed and the database rename could not be undone")?;
-        return Err(e.into());
+        let e = anyhow::Error::from(e);
+        app.store.rename_collection(new, old).with_context(|| {
+            format!(
+                "config save failed ({e:#}) and the database rename could not be undone: \
+                 the database names '{new}' while the config names '{old}'"
+            )
+        })?;
+        return Err(e);
     }
     app.store.sync_config_to_db(&app.config)?;
     println!("✓ Renamed collection '{old}' to '{new}' ({moved} documents)");
@@ -497,6 +501,218 @@ pub fn collection_include(location: &IndexLocation, name: &str, include: bool) -
     Ok(())
 }
 
+/// What a `context` command names: the global context, or a path prefix in
+/// one collection.
+enum ContextTarget {
+    Global,
+    Prefix { collection: String, prefix: String },
+}
+
+impl ContextTarget {
+    fn display(&self) -> String {
+        match self {
+            Self::Global => "/ (global)".to_owned(),
+            Self::Prefix { collection, prefix } if prefix == "/" => format!("qmd://{collection}/"),
+            Self::Prefix { collection, prefix } => format!("qmd://{collection}{prefix}"),
+        }
+    }
+}
+
+/// Resolve `/` (global), `qmd://collection/path`, or a directory inside a
+/// collection (default: the current one).
+fn context_target(app: &App, arg: Option<&str>) -> Result<ContextTarget> {
+    let arg = arg.unwrap_or(".");
+    if arg == "/" {
+        return Ok(ContextTarget::Global);
+    }
+    if let Some(rest) = arg.strip_prefix("qmd://") {
+        let (collection, path) = rest.split_once('/').unwrap_or((rest, ""));
+        require_collection(app, collection)?;
+        return Ok(ContextTarget::Prefix {
+            collection: collection.to_owned(),
+            prefix: config::normalize_context_prefix(path),
+        });
+    }
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    let target = canonical_lenient(&std::path::absolute(cwd.join(arg))?);
+    let target = target
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/");
+    let containing: Vec<(&String, usize, &str)> = app
+        .config
+        .collections
+        .iter()
+        .filter_map(|(name, coll)| {
+            let root = coll.path.trim_end_matches('/');
+            let rest = target.strip_prefix(root)?;
+            (rest.is_empty() || rest.starts_with('/')).then_some((name, root.len(), rest))
+        })
+        .collect();
+    let Some(depth) = containing.iter().map(|(_, depth, _)| *depth).max() else {
+        bail!("{target} is not inside any collection; name one as qmd://<collection>/<path>");
+    };
+    let deepest: Vec<_> = containing.iter().filter(|(_, d, _)| *d == depth).collect();
+    let [(collection, _, rest)] = deepest.as_slice() else {
+        let names: Vec<&str> = deepest.iter().map(|(name, _, _)| name.as_str()).collect();
+        bail!(
+            "{target} is in collections {} at the same root; name one as \
+             qmd://<collection>/<path>",
+            names.join(", ")
+        );
+    };
+    Ok(ContextTarget::Prefix {
+        collection: (*collection).clone(),
+        prefix: config::normalize_context_prefix(rest),
+    })
+}
+
+/// `path` canonicalized through its deepest existing ancestor, with the
+/// components below that appended as written.
+fn canonical_lenient(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(found) = std::fs::canonicalize(existing) {
+            return missing.iter().rev().fold(found, |acc, part| acc.join(part));
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+pub fn context_add(location: &IndexLocation, path: Option<&str>, text: &str) -> Result<()> {
+    let mut app = open(location)?;
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("give the context text");
+    }
+    let target = context_target(&app, path)?;
+    match &target {
+        ContextTarget::Global => app.config.global_context = Some(text.to_owned()),
+        ContextTarget::Prefix { collection, prefix } => {
+            app.config.add_context(collection, prefix, text);
+        }
+    }
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!("✓ Set context for {}", target.display());
+    Ok(())
+}
+
+pub fn context_remove(location: &IndexLocation, path: &str) -> Result<()> {
+    let mut app = open(location)?;
+    let target = context_target(&app, Some(path))?;
+    let removed = match &target {
+        ContextTarget::Global => app.config.global_context.take().is_some(),
+        ContextTarget::Prefix { collection, prefix } => {
+            app.config.remove_context(collection, prefix)
+        }
+    };
+    if !removed {
+        bail!(
+            "no context set for {} (run 'qmd context list')",
+            target.display()
+        );
+    }
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!("✓ Removed context for {}", target.display());
+    Ok(())
+}
+
+pub fn context_list(location: &IndexLocation) -> Result<()> {
+    let app = open_without_sync(location)?;
+    let c = colors();
+    let mut any = false;
+    if let Some(global) = &app.config.global_context {
+        println!("{}/ (global){}\n  {global}", c.cyan, c.reset);
+        any = true;
+    }
+    for (name, coll) in &app.config.collections {
+        let Some(map) = coll.context.as_ref().filter(|m| !m.is_empty()) else {
+            continue;
+        };
+        let mut entries: Vec<(String, &String)> = map
+            .iter()
+            .map(|(k, v)| (config::normalize_context_prefix(k), v))
+            .collect();
+        entries.sort();
+        for (prefix, text) in entries {
+            let target = ContextTarget::Prefix {
+                collection: name.clone(),
+                prefix,
+            };
+            println!("{}{}{}\n  {text}", c.cyan, target.display(), c.reset);
+        }
+        any = true;
+    }
+    if !any {
+        println!(
+            "No contexts. Add one with: qmd context add qmd://<collection>/ \"what it holds\""
+        );
+    }
+    Ok(())
+}
+
+pub fn context_check(location: &IndexLocation) -> Result<()> {
+    let app = open_without_sync(location)?;
+    let mut bare = Vec::new();
+    let mut uncovered = Vec::new();
+    for (name, coll) in &app.config.collections {
+        let prefixes: Vec<String> = coll
+            .context
+            .iter()
+            .flat_map(|m| m.keys())
+            .map(|k| config::normalize_context_prefix(k))
+            .collect();
+        if prefixes.is_empty() {
+            bare.push(name.clone());
+            continue;
+        }
+        if prefixes.iter().any(|p| p == "/") {
+            continue;
+        }
+        let mut dirs: Vec<String> = app
+            .store
+            .active_document_paths(name)?
+            .into_iter()
+            .filter_map(|p| p.split_once('/').map(|(dir, _)| format!("/{dir}")))
+            .filter(|dir| {
+                !prefixes
+                    .iter()
+                    .any(|p| dir == p || dir.starts_with(&format!("{p}/")))
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        uncovered.extend(dirs.into_iter().map(|dir| format!("qmd://{name}{dir}/")));
+    }
+    if bare.is_empty() && uncovered.is_empty() {
+        println!("✓ Every collection has context");
+        return Ok(());
+    }
+    if !bare.is_empty() {
+        println!("Collections without context:");
+        for name in &bare {
+            println!("  qmd://{name}/");
+        }
+    }
+    if !uncovered.is_empty() {
+        println!("Top-level directories without context:");
+        for dir in &uncovered {
+            println!("  {dir}");
+        }
+    }
+    println!("\nAdd one with: qmd context add <path> \"what it holds\"");
+    Ok(())
+}
+
 pub fn cleanup(location: &IndexLocation, dry_run: bool) -> Result<()> {
     let app = if dry_run {
         open_without_sync(location)?
@@ -561,13 +777,14 @@ fn run_update_command(location: &IndexLocation, root: &Path, command: &str) -> R
     Ok(())
 }
 
-/// `cmd /C` reads the rest of its command line verbatim and does not undo
-/// `arg`'s MSVC quoting, so the command goes in raw.
+/// `cmd` does not undo `arg`'s MSVC quoting, so the command goes in raw. With
+/// `/S`, `cmd` strips exactly the outer quotes added here; without it, a command
+/// that starts with a quote loses its own first and last quote.
 #[cfg(windows)]
 fn shell_command(command: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut shell = std::process::Command::new("cmd");
-    shell.arg("/C").raw_arg(command);
+    shell.raw_arg(format!("/S /C \"{command}\""));
     shell
 }
 
@@ -1089,10 +1306,15 @@ pub fn query(
     Ok(())
 }
 
-pub fn embed(location: &IndexLocation, force: bool, collection: Option<&str>) -> Result<()> {
+pub fn embed(
+    location: &IndexLocation,
+    force: bool,
+    collection: Option<&str>,
+    max_duration: Option<std::time::Duration>,
+) -> Result<()> {
     use std::io::Write as _;
 
-    use qmd::embed::{EmbedOptions, generate_embeddings};
+    use qmd::embed::{EmbedOptions, EmbedStop, generate_embeddings};
 
     let app = open(location)?;
     if let Some(name) = collection
@@ -1112,6 +1334,7 @@ pub fn embed(location: &IndexLocation, force: bool, collection: Option<&str>) ->
     let options = EmbedOptions {
         force,
         collection: collection.map(str::to_owned),
+        max_duration,
         on_progress: Some(Box::new(|p: &qmd::embed::EmbedProgress| {
             print!(
                 "\r  {} / {} chunks embedded ({} errors)",
@@ -1122,22 +1345,52 @@ pub fn embed(location: &IndexLocation, force: bool, collection: Option<&str>) ->
         ..Default::default()
     };
     let result = generate_embeddings(&app.store, embedder.as_ref(), &options)?;
+    if result.docs_processed > 0 {
+        println!();
+    }
+    if result.orphans_removed > 0 {
+        println!(
+            "Deleted {} vector(s) of content no document holds any more",
+            result.orphans_removed
+        );
+    }
     if result.docs_processed == 0 {
         println!("✓ All documents already embedded.");
         return Ok(());
     }
-    println!();
     println!(
         "✓ Embedded {} chunk(s) across {} document(s) in {:.1}s",
         result.chunks_embedded,
         result.docs_processed,
         result.duration_ms as f64 / 1000.0
     );
+    const SHOWN_FAILURES: usize = 20;
     if !result.failures.is_empty() {
         println!("⚠ {} chunk(s) failed:", result.failures.len());
-        for f in &result.failures {
+        for f in result.failures.iter().take(SHOWN_FAILURES) {
             println!("  {} #{} ({}): {}", f.path, f.seq, f.hash, f.reason);
         }
+        if result.failures.len() > SHOWN_FAILURES {
+            println!("  … and {} more", result.failures.len() - SHOWN_FAILURES);
+        }
+    }
+    let left =
+        || -> Result<usize> { Ok(app.store.pending_embedding_docs(collection, &model)?.len()) };
+    match result.stopped {
+        Some(EmbedStop::ErrorRate { failed, attempted }) => bail!(
+            "stopped: {failed} of {attempted} attempted chunks failed; {} document(s) still \
+             need embedding",
+            left()?
+        ),
+        Some(EmbedStop::TimeLimit(limit)) => println!(
+            "⚠ Stopped at the {}-minute cap (--max-duration); {} document(s) still need \
+             embedding. Run qmd embed again to continue.",
+            limit.as_secs() / 60,
+            left()?
+        ),
+        None => {}
+    }
+    if !result.failures.is_empty() {
         bail!("embedding completed with {} error(s)", result.errors);
     }
     Ok(())

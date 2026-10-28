@@ -158,6 +158,22 @@ pub fn extract_snippet_at(
 }
 
 impl Snippet {
+    /// This snippet of a body that starts `offset` lines into its file (a
+    /// section), numbered as the file's lines.
+    #[must_use]
+    pub fn in_file(mut self, offset: usize) -> Self {
+        if offset == 0 {
+            return self;
+        }
+        let header = format!("@@ -{},", self.start_line);
+        self.line += offset;
+        self.start_line += offset;
+        if let Some(rest) = self.text.strip_prefix(&header) {
+            self.text = format!("@@ -{},{rest}", self.start_line);
+        }
+        self
+    }
+
     /// The text with the `@@` header unnumbered and each body line prefixed
     /// with its real line number.
     pub fn numbered(&self) -> String {

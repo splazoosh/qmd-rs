@@ -35,6 +35,10 @@ pub const CHUNK_WINDOW_CHARS: usize = CHUNK_WINDOW_TOKENS * 4;
 pub const MIN_CHUNK_TOKENS: usize = 64;
 pub const MAX_CHUNK_TOKENS: usize = 1800;
 
+/// Shallowest and deepest heading level a collection's sections may be cut at.
+pub const MIN_SECTION_LEVEL: u8 = 1;
+pub const MAX_SECTION_LEVEL: u8 = 6;
+
 /// Chunk geometry in tokens. Everything follows from the size: overlap is
 /// 15% of it, and the break-point window is 200 tokens or half the size,
 /// whichever is smaller, so a cut can never fall in a chunk's first half.
@@ -45,6 +49,10 @@ pub struct ChunkParams {
     pub overlap_tokens: usize,
     pub window_tokens: usize,
     pub boundary: ChunkBoundary,
+    /// Set by [`ChunkParams::sections`]: every chunk is one section at this
+    /// heading level, or a paragraph-cut part of one longer than
+    /// `size_tokens`; the window fields are unused.
+    pub section_level: Option<u8>,
 }
 
 /// Where a chunk may end and the next begin.
@@ -99,6 +107,21 @@ impl ChunkParams {
             overlap_tokens: size_tokens * 15 / 100,
             window_tokens: CHUNK_WINDOW_TOKENS.min(size_tokens / 2),
             boundary: ChunkBoundary::Window,
+            section_level: None,
+        }
+    }
+
+    /// Section chunks at heading `level` (clamped to
+    /// [`MIN_SECTION_LEVEL`]..=[`MAX_SECTION_LEVEL`]). A section is split
+    /// only when it is longer than the embedder takes in one input,
+    /// [`MAX_CHUNK_TOKENS`].
+    pub fn sections(level: u8) -> Self {
+        Self {
+            size_tokens: MAX_CHUNK_TOKENS,
+            overlap_tokens: 0,
+            window_tokens: 0,
+            boundary: ChunkBoundary::Window,
+            section_level: Some(level.clamp(MIN_SECTION_LEVEL, MAX_SECTION_LEVEL)),
         }
     }
 
@@ -457,6 +480,16 @@ pub fn chunk_document_default(content: &str) -> Vec<Chunk> {
 
 /// [`chunk_document`] with `params` in the ~4 chars/token approximation.
 pub fn chunk_document_for(content: &str, params: &ChunkParams) -> Vec<Chunk> {
+    if let Some(level) = params.section_level {
+        return section_chunks(content, &CharTokens, level, params.size_tokens)
+            .expect("the char approximation cannot fail")
+            .into_iter()
+            .map(|c| Chunk {
+                text: c.text,
+                pos: c.pos,
+            })
+            .collect();
+    }
     chunk_document_bounded(
         content,
         params.size_tokens * 4,
@@ -478,6 +511,24 @@ const TOKEN_PASS_CHARS_PER_TOKEN: usize = 3;
 /// length of text from its offset.
 pub fn token_chunks_at(content: &str, params: &ChunkParams, positions: &[usize]) -> Vec<Chunk> {
     let max_chars = params.size_tokens * TOKEN_PASS_CHARS_PER_TOKEN;
+    if let Some(level) = params.section_level {
+        let sections = split_sections(content, level);
+        return positions
+            .iter()
+            .map(|&pos| {
+                let start = floor_char_boundary(content, pos.min(content.len()));
+                let section_end = sections
+                    .iter()
+                    .find(|s| s.start <= start && start < s.end)
+                    .map_or(content.len(), |s| s.end);
+                let end = floor_char_boundary(content, section_end.min(start + max_chars));
+                Chunk {
+                    text: content[start..end].to_owned(),
+                    pos: start,
+                }
+            })
+            .collect();
+    }
     let first_pass = chunk_document_bounded(
         content,
         max_chars,
@@ -525,6 +576,7 @@ pub fn chunk_document_by_tokens(
             overlap_tokens,
             window_tokens,
             boundary: ChunkBoundary::Window,
+            section_level: None,
         },
     )
 }
@@ -539,7 +591,11 @@ fn chunk_by_tokens(
         overlap_tokens,
         window_tokens,
         boundary,
+        section_level,
     } = *params;
+    if let Some(level) = section_level {
+        return section_chunks(content, tokenizer, level, max_tokens);
+    }
     let avg_chars_per_token = TOKEN_PASS_CHARS_PER_TOKEN;
     let max_chars = max_tokens * avg_chars_per_token;
     let overlap_chars = overlap_tokens * avg_chars_per_token;
@@ -712,6 +768,366 @@ fn push_chunk_within_token_limit(
         )?;
     }
     Ok(())
+}
+
+/// One section of a document at a heading level: from a heading at that
+/// level or shallower to the next such heading, deeper headings inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// Byte span in the document; the sections of a document partition it.
+    pub start: usize,
+    pub end: usize,
+    /// Level of the section's heading; 0 for text before the first heading
+    /// at the level or shallower, and for a document with none.
+    pub level: u8,
+    /// The heading's text, without its `#` marks; empty at level 0.
+    pub heading: String,
+    /// The headings enclosing it, outermost first, then its own.
+    pub trail: Vec<String>,
+    /// First and last line (1-based) holding text; trailing blank lines are
+    /// not counted.
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// An ATX heading line (`#` to `######`, then a space or the line's end, at
+/// most three spaces in): its level and text, closing `#`s stripped.
+fn atx_heading(line: &str) -> Option<(u8, &str)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after = &rest[hashes..];
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let text = after.trim();
+    let closed = text.trim_end_matches('#');
+    let text = if closed.is_empty() || closed.ends_with([' ', '\t']) {
+        closed.trim_end()
+    } else {
+        text
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    Some((hashes as u8, text))
+}
+
+/// A code fence opening line (three or more backticks or tildes, at most
+/// three spaces in): its character and length.
+fn fence_open(line: &str) -> Option<(u8, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let ch = *rest.as_bytes().first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let n = rest.bytes().take_while(|b| *b == ch).count();
+    (n >= 3).then_some((ch, n))
+}
+
+/// Whether `line` closes a fence opened with `n` of `ch`.
+fn fence_closes(line: &str, ch: u8, n: usize) -> bool {
+    fence_open(line).is_some_and(|(c, m)| {
+        c == ch && m >= n && line.trim_start_matches(' ')[m..].trim().is_empty()
+    })
+}
+
+/// Each line of `content` as (byte offset, text without its line ending,
+/// inside a code fence). A fence's closing line counts as inside, its
+/// opening line does not.
+fn scan_lines(content: &str) -> Vec<(usize, &str, bool)> {
+    let mut lines = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0;
+    for raw in content.split_inclusive('\n') {
+        let start = offset;
+        offset += raw.len();
+        let text = raw.trim_end_matches('\n').trim_end_matches('\r');
+        let fenced = if let Some((ch, n)) = fence {
+            if fence_closes(text, ch, n) {
+                fence = None;
+            }
+            true
+        } else if let Some(open) = fence_open(text) {
+            fence = Some(open);
+            false
+        } else {
+            false
+        };
+        lines.push((start, text, fenced));
+    }
+    lines
+}
+
+/// Split `content` into its sections at heading `level`: a section starts at
+/// each heading of that level or shallower outside a code fence and runs to
+/// the next. Text before the first such heading is a level-0 section of its
+/// own unless it is only whitespace, which joins the first section; a
+/// document with no such heading is one level-0 section. A section holding
+/// nothing but its heading joins the section after it, which keeps that
+/// section's heading.
+pub fn split_sections(content: &str, level: u8) -> Vec<Section> {
+    struct Cut {
+        start: usize,
+        level: u8,
+        heading: String,
+        trail: Vec<String>,
+    }
+    let mut cuts: Vec<Cut> = Vec::new();
+    let mut stack: Vec<(u8, String)> = Vec::new();
+    for (start, text, fenced) in scan_lines(content) {
+        if fenced {
+            continue;
+        }
+        let Some((h, heading)) = atx_heading(text) else {
+            continue;
+        };
+        while stack.last().is_some_and(|(l, _)| *l >= h) {
+            stack.pop();
+        }
+        stack.push((h, heading.to_owned()));
+        if h <= level {
+            cuts.push(Cut {
+                start,
+                level: h,
+                heading: heading.to_owned(),
+                trail: stack.iter().map(|(_, t)| t.clone()).collect(),
+            });
+        }
+    }
+
+    let mut spans: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    match cuts.first() {
+        None => spans.push((0, content.len(), None)),
+        Some(first) if first.start > 0 && !content[..first.start].trim().is_empty() => {
+            spans.push((0, first.start, None));
+        }
+        Some(_) => {}
+    }
+    for (i, cut) in cuts.iter().enumerate() {
+        let start = if i == 0 && spans.is_empty() {
+            0
+        } else {
+            cut.start
+        };
+        let end = cuts.get(i + 1).map_or(content.len(), |c| c.start);
+        spans.push((start, end, Some(i)));
+    }
+
+    let mut joined: Vec<(usize, usize, Option<usize>)> = Vec::with_capacity(spans.len());
+    let mut carry: Option<usize> = None;
+    for (i, &(start, end, cut)) in spans.iter().enumerate() {
+        let start = carry.take().unwrap_or(start);
+        if cut.is_some() && i + 1 < spans.len() && heading_lines_only(&content[start..end]) {
+            carry = Some(start);
+        } else {
+            joined.push((start, end, cut));
+        }
+    }
+
+    let mut sections = Vec::with_capacity(joined.len());
+    let mut line = 1usize;
+    let mut counted = 0usize;
+    for (start, end, cut) in joined {
+        line += content[counted..start].matches('\n').count();
+        counted = start;
+        let body = content[start..end].trim_end();
+        let (level, heading, trail) = match cut {
+            Some(i) => (
+                cuts[i].level,
+                cuts[i].heading.clone(),
+                cuts[i].trail.clone(),
+            ),
+            None => (0, String::new(), Vec::new()),
+        };
+        sections.push(Section {
+            start,
+            end,
+            level,
+            heading,
+            trail,
+            start_line: line,
+            end_line: line + body.matches('\n').count(),
+        });
+    }
+    sections
+}
+
+/// Whether every non-blank line of `text` is an ATX heading.
+fn heading_lines_only(text: &str) -> bool {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| atx_heading(l.trim_end_matches('\r')).is_some())
+}
+
+/// ~4 chars a token, the char-space approximation.
+struct CharTokens;
+
+impl Tokenizer for CharTokens {
+    fn count_tokens(&self, text: &str) -> Result<usize> {
+        Ok(text.chars().count().div_ceil(4))
+    }
+
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> Result<String> {
+        Ok(text.chars().take(max_tokens * 4).collect())
+    }
+}
+
+/// The chunks of `content` under [`ChunkParams::sections`]: each section at
+/// `level` whole, or cut by [`section_parts`] when it is longer than
+/// `max_tokens`.
+///
+/// # Errors
+/// Propagates tokenizer failures.
+pub fn section_chunks(
+    content: &str,
+    tokenizer: &dyn Tokenizer,
+    level: u8,
+    max_tokens: usize,
+) -> Result<Vec<TokenChunk>> {
+    let mut chunks = Vec::new();
+    for section in split_sections(content, level) {
+        chunks.extend(section_parts(
+            &content[section.start..section.end],
+            section.start,
+            tokenizer,
+            max_tokens,
+        )?);
+    }
+    Ok(chunks)
+}
+
+/// How finely [`section_parts`] cuts a piece that does not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Paragraph,
+    Line,
+    Char,
+}
+
+/// One section (`text`, at byte offset `pos` in its document) as parts of
+/// at most `max_tokens`: whole when it fits, else cut at paragraph starts
+/// (a line after a blank line, outside a code fence), packed greedily. A
+/// paragraph that alone does not fit is cut at line starts, and a line that
+/// does not fit at characters. The parts partition the section: nothing is
+/// truncated or overlapped.
+///
+/// # Errors
+/// Propagates tokenizer failures.
+pub fn section_parts(
+    text: &str,
+    pos: usize,
+    tokenizer: &dyn Tokenizer,
+    max_tokens: usize,
+) -> Result<Vec<TokenChunk>> {
+    let mut parts = Vec::new();
+    fit_parts(
+        text,
+        pos,
+        tokenizer,
+        max_tokens.max(1),
+        Cut::Paragraph,
+        &mut parts,
+    )?;
+    Ok(parts)
+}
+
+fn fit_parts(
+    text: &str,
+    pos: usize,
+    tokenizer: &dyn Tokenizer,
+    max_tokens: usize,
+    cut: Cut,
+    parts: &mut Vec<TokenChunk>,
+) -> Result<()> {
+    let tokens = tokenizer.count_tokens(text)?;
+    if tokens <= max_tokens || text.chars().nth(1).is_none() {
+        parts.push(TokenChunk {
+            text: text.to_owned(),
+            pos,
+            tokens,
+        });
+        return Ok(());
+    }
+    let starts: Vec<usize> = match cut {
+        Cut::Paragraph => {
+            let lines = scan_lines(text);
+            lines
+                .windows(2)
+                .filter(|w| w[0].1.trim().is_empty() && !w[1].1.trim().is_empty() && !w[1].2)
+                .map(|w| w[1].0)
+                .collect()
+        }
+        Cut::Line => text.match_indices('\n').map(|(i, _)| i + 1).collect(),
+        Cut::Char => {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let step =
+                ((text.len() as f64 * max_tokens as f64 / tokens as f64) * 0.9).max(1.0) as usize;
+            let mut starts = Vec::new();
+            let mut at = 0;
+            loop {
+                let mut next = floor_char_boundary(text, at + step);
+                if next <= at {
+                    next = next_char_boundary(text, at);
+                }
+                if next >= text.len() {
+                    break;
+                }
+                starts.push(next);
+                at = next;
+            }
+            starts
+        }
+    };
+    let starts: Vec<usize> = starts
+        .into_iter()
+        .filter(|&s| s > 0 && s < text.len())
+        .collect();
+    let finer = match cut {
+        Cut::Paragraph => Cut::Line,
+        Cut::Line | Cut::Char => Cut::Char,
+    };
+    if starts.is_empty() {
+        return fit_parts(text, pos, tokenizer, max_tokens, finer, parts);
+    }
+
+    let bounds: Vec<usize> = std::iter::once(0)
+        .chain(starts)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let flush = |start: usize, end: usize, parts: &mut Vec<TokenChunk>| {
+        fit_parts(
+            &text[start..end],
+            pos + start,
+            tokenizer,
+            max_tokens,
+            finer,
+            parts,
+        )
+    };
+    let mut run_start = 0usize;
+    let mut run_end = bounds[1];
+    for w in bounds[1..].windows(2) {
+        let end = w[1];
+        if tokenizer.count_tokens(&text[run_start..end])? <= max_tokens {
+            run_end = end;
+        } else {
+            flush(run_start, run_end, parts)?;
+            run_start = w[0];
+            run_end = end;
+        }
+    }
+    flush(run_start, run_end, parts)
 }
 
 #[cfg(test)]
@@ -1173,5 +1589,166 @@ mod tests {
         for c in &chunks {
             assert!(c.tokens <= 100);
         }
+    }
+
+    /// Each section's (level, heading, text).
+    fn sections_of(content: &str, level: u8) -> Vec<(u8, String, &str)> {
+        let sections = split_sections(content, level);
+        assert_eq!(sections.first().map(|s| s.start), Some(0));
+        assert_eq!(sections.last().map(|s| s.end), Some(content.len()));
+        assert!(sections.windows(2).all(|w| w[0].end == w[1].start));
+        sections
+            .into_iter()
+            .map(|s| (s.level, s.heading, &content[s.start..s.end]))
+            .collect()
+    }
+
+    #[test]
+    fn sections_keep_deeper_headings_and_cut_at_shallower_ones() {
+        let doc = "# Guide\n\nIntro.\n\n## Install\n\nSteps.\n\n### Linux\n\napt.\n\n\
+                   #### Notes\n\nmore.\n\n## Use\n\nRun it.\n\n# Appendix\n\nExtra.\n";
+        let at2 = sections_of(doc, 2);
+        let headings: Vec<&str> = at2.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(headings, ["Guide", "Install", "Use", "Appendix"]);
+        assert!(at2[1].2.contains("### Linux") && at2[1].2.contains("#### Notes"));
+        assert_eq!(at2[3].0, 1, "a shallower heading starts a section too");
+
+        let at3 = sections_of(doc, 3);
+        let headings: Vec<&str> = at3.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(headings, ["Guide", "Install", "Linux", "Use", "Appendix"]);
+        let linux = &split_sections(doc, 3)[2];
+        assert_eq!(linux.trail, ["Guide", "Install", "Linux"]);
+        assert_eq!((linux.start_line, linux.end_line), (9, 15));
+    }
+
+    #[test]
+    fn sections_follow_skipped_levels() {
+        let doc = "# Top\n\ntext\n\n### Deep\n\ndeep text\n\n## Mid\n\nmid text\n";
+        let at2 = sections_of(doc, 2);
+        assert_eq!(at2.len(), 2);
+        assert!(at2[0].2.contains("### Deep"));
+        let at3 = split_sections(doc, 3);
+        assert_eq!(at3[1].heading, "Deep");
+        assert_eq!(at3[1].trail, ["Top", "Deep"]);
+        assert_eq!(at3[2].trail, ["Top", "Mid"]);
+    }
+
+    #[test]
+    fn text_before_the_first_heading_is_its_own_section() {
+        let doc = "---\ntitle: x\n---\nLead paragraph.\n\n## One\n\nBody.\n";
+        let s = sections_of(doc, 2);
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[0].0, s[0].1.as_str()), (0, ""));
+        assert!(s[0].2.starts_with("---\ntitle"));
+        assert_eq!(split_sections(doc, 2)[1].start_line, 6);
+
+        let s = sections_of("\n\n## One\n\nBody.\n", 2);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].1, "One");
+    }
+
+    #[test]
+    fn a_document_with_no_heading_at_the_level_is_one_section() {
+        let doc = "Plain notes.\n\n### Too deep\n\nStill one section.\n";
+        let s = sections_of(doc, 2);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].0, s[0].1.as_str()), (0, ""));
+        let s = split_sections(doc, 2);
+        assert_eq!((s[0].start_line, s[0].end_line), (1, 5));
+    }
+
+    #[test]
+    fn headings_in_code_fences_are_not_headings() {
+        let doc = "## Real\n\n```sh\n# comment\n## also a comment\n```\n\n~~~\n## tilde\n~~~\n\n\
+                   ## Next\n\nx\n";
+        let s = sections_of(doc, 2);
+        let headings: Vec<&str> = s.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(headings, ["Real", "Next"]);
+
+        let s = sections_of("## A\n#hashtag\n    ## code\n####### seven\n", 2);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn a_heading_only_section_joins_the_next() {
+        let doc = "# Title\n\n## Intro\n\nWords.\n\n## Empty\n\n## Last\n\nEnd.\n## Tail\n";
+        let s = sections_of(doc, 2);
+        let headings: Vec<&str> = s.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(headings, ["Intro", "Last", "Tail"]);
+        assert!(s[0].2.starts_with("# Title"));
+        assert!(s[1].2.starts_with("## Empty"));
+        assert_eq!(split_sections(doc, 2)[0].trail, ["Title", "Intro"]);
+        assert_eq!(atx_heading("## Closed ##"), Some((2, "Closed")));
+        assert_eq!(atx_heading("## C#"), Some((2, "C#")));
+    }
+
+    #[test]
+    fn a_section_too_long_for_the_embedder_splits_at_paragraphs() {
+        let para = |i: usize| format!("Paragraph {i} {}\n", "word ".repeat(40));
+        let body: String = (0..12).map(|i| format!("{}\n", para(i))).collect();
+        let doc = format!(
+            "## Short\n\nsmall\n\n## Long\n\n{body}```\n{}```\n\n## After\n\nz\n",
+            "line\n\nx\n".repeat(30)
+        );
+        let chunks = section_chunks(&doc, &ApproxTokenizer, 2, 120).unwrap();
+        let sections = split_sections(&doc, 2);
+        let long = &sections[1];
+        let parts: Vec<&TokenChunk> = chunks
+            .iter()
+            .filter(|c| c.pos >= long.start && c.pos < long.end)
+            .collect();
+        assert!(parts.len() > 2, "{} parts", parts.len());
+        assert_eq!(parts[0].pos, long.start);
+        for w in parts.windows(2) {
+            assert_eq!(w[0].pos + w[0].text.len(), w[1].pos);
+        }
+        let last = parts.last().unwrap();
+        assert_eq!(last.pos + last.text.len(), long.end);
+        for p in &parts {
+            assert!(p.tokens <= 120, "{} tokens", p.tokens);
+        }
+        for p in &parts[1..] {
+            assert!(doc[..p.pos].ends_with("\n\n") || doc[..p.pos].ends_with('\n'));
+        }
+        assert!(
+            parts
+                .iter()
+                .filter(|p| p.text.starts_with("Paragraph"))
+                .count()
+                >= 2,
+            "cut at paragraph starts"
+        );
+        assert_eq!(chunks[0].text, &doc[sections[0].start..sections[0].end]);
+        assert_eq!(chunks.last().unwrap().text, "## After\n\nz\n");
+        let rejoined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(rejoined, doc);
+    }
+
+    #[test]
+    fn an_unbroken_section_still_splits_without_losing_text() {
+        let doc = format!("## Blob\n{}", "x".repeat(5_000));
+        let chunks = section_chunks(&doc, &ApproxTokenizer, 2, 100).unwrap();
+        assert!(chunks.len() > 10);
+        assert!(chunks.iter().all(|c| c.tokens <= 100));
+        let rejoined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(rejoined, doc);
+    }
+
+    #[test]
+    fn section_params_route_both_chunkers() {
+        let params = ChunkParams::sections(2);
+        assert_eq!(params.size_tokens, MAX_CHUNK_TOKENS);
+        assert_eq!(
+            ChunkParams::sections(9).section_level,
+            Some(MAX_SECTION_LEVEL)
+        );
+        let doc = "## A\n\nalpha\n\n## B\n\nbeta\n";
+        let chars = chunk_document_for(doc, &params);
+        let tokens = chunk_document_by_tokens_for(doc, &ApproxTokenizer, &params).unwrap();
+        assert_eq!(chars.len(), 2);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(chars[1].pos, tokens[1].pos);
+        let rebuilt = token_chunks_at(doc, &params, &[tokens[1].pos]);
+        assert_eq!(rebuilt[0].text, "## B\n\nbeta\n");
     }
 }

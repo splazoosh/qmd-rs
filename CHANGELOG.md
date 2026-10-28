@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- Section documents: `sectionLevel: N` (1–6), `collection add --section-level N`
+  or `collection sections <name> [N]` makes each section of a file at heading
+  level N its own document. BM25 ranks sections with their own statistics,
+  vector hits map to the section that holds them, and fusion, best-chunk
+  selection and rerank work per section, so one file can give several
+  results. Results in every format and over MCP carry `section` (heading,
+  level, line span) and an identity `collection/path#K` that `get` reads.
+  A section longer than 1800 tokens is split at paragraph boundaries for
+  embedding only. Collections that do not opt in are unchanged and are not
+  re-embedded.
+- `get` by docid returns that docid's own document when two collections'
+  names make their `qmd://` paths the same string (collection `a` holding
+  `b/x.md` and collection `a/b` holding `x.md`); 0.4.0 could return the
+  other document.
+- `get collection/path` prefers the path in its exact case: with `Path.md` and
+  `path.md` in one collection, `get notes/path.md` returns `path.md`, where
+  0.4.0 returned `Path.md`. Collection names that differ only in case resolve
+  the same way.
+
 ## 0.4.0
 
 - New `qmd context` commands: `context add [PATH] TEXT`, `context list`,

@@ -5,10 +5,11 @@
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use crate::chunk::{ChunkBoundary, ChunkParams};
+use crate::chunk::{ChunkBoundary, ChunkParams, MAX_SECTION_LEVEL, MIN_SECTION_LEVEL};
 use crate::config::{Collection, CollectionConfig, ContextMap, NamedCollection};
 use crate::error::Result;
 use crate::store::Store;
+use crate::store::sections::SECTION_LEVEL;
 
 /// A collection merged with its database statistics.
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ impl Store {
         for n in &mut named {
             n.collection.chunk_tokens = self.chunk_tokens_setting(&n.name)?;
             n.collection.chunk_boundary = self.chunk_boundary_setting(&n.name)?;
+            n.collection.section_level = self.section_level(&n.name)?;
         }
         Ok(named)
     }
@@ -56,6 +58,7 @@ impl Store {
             .map(|mut n| {
                 n.collection.chunk_tokens = self.chunk_tokens_setting(name)?;
                 n.collection.chunk_boundary = self.chunk_boundary_setting(name)?;
+                n.collection.section_level = self.section_level(name)?;
                 Ok(n)
             })
             .transpose()
@@ -95,9 +98,10 @@ impl Store {
         self.set_chunk_settings(name, collection)
     }
 
-    /// Chunk size and boundary are kept in `store_config`
-    /// (`chunk_tokens:<collection>`, `chunk_boundary:<collection>`) rather
-    /// than new `store_collections` columns, so the table stays the TS layout.
+    /// Chunk size, boundary and section level are kept in `store_config`
+    /// (`chunk_tokens:<collection>`, `chunk_boundary:<collection>`,
+    /// `section_level:<collection>`) rather than new `store_collections`
+    /// columns, so the table stays the TS layout.
     fn set_chunk_settings(&self, name: &str, collection: &Collection) -> Result<()> {
         self.set_collection_setting(
             "chunk_tokens",
@@ -108,6 +112,13 @@ impl Store {
             "chunk_boundary",
             name,
             collection.chunk_boundary.map(|b| b.as_str().to_owned()),
+        )?;
+        self.set_collection_setting(
+            SECTION_LEVEL,
+            name,
+            collection
+                .section_level
+                .map(|l| l.clamp(MIN_SECTION_LEVEL, MAX_SECTION_LEVEL).to_string()),
         )
     }
 
@@ -135,7 +146,7 @@ impl Store {
         Ok(())
     }
 
-    fn collection_setting(&self, prefix: &str, name: &str) -> Result<Option<String>> {
+    pub(super) fn collection_setting(&self, prefix: &str, name: &str) -> Result<Option<String>> {
         Ok(self
             .conn()
             .query_row(
@@ -161,6 +172,9 @@ impl Store {
     /// Chunk geometry for a collection: its `chunkTokens` and
     /// `chunkBoundary`, else the defaults.
     pub fn collection_chunk_params(&self, name: &str) -> Result<ChunkParams> {
+        if let Some(level) = self.section_level(name)? {
+            return Ok(ChunkParams::sections(level));
+        }
         Ok(self
             .chunk_tokens_setting(name)?
             .map_or_else(ChunkParams::default, ChunkParams::for_size)
@@ -217,6 +231,8 @@ impl Store {
                     .execute("DELETE FROM store_config WHERE key = 'global_context'", [])?;
             }
         }
+
+        self.sync_sections(None)?;
 
         self.conn().execute(
             "INSERT INTO store_config (key, value) VALUES ('config_hash', ?1)
@@ -283,6 +299,7 @@ impl Store {
             params![name],
         )?;
         self.clear_chunk_settings(name)?;
+        self.sync_sections(None)?;
         Ok((deleted, cleaned))
     }
 
@@ -301,13 +318,14 @@ impl Store {
             "UPDATE store_collections SET name = ?2 WHERE name = ?1",
             params![old, new],
         )?;
-        for prefix in ["chunk_tokens", "chunk_boundary"] {
+        for prefix in ["chunk_tokens", "chunk_boundary", SECTION_LEVEL] {
             tx.execute(
                 "UPDATE store_config SET key = ?2 WHERE key = ?1",
                 params![format!("{prefix}:{old}"), format!("{prefix}:{new}")],
             )?;
         }
         tx.commit()?;
+        self.sync_sections(None)?;
         Ok(moved)
     }
 
@@ -387,6 +405,7 @@ fn row_to_named_collection(r: &rusqlite::Row<'_>) -> rusqlite::Result<NamedColle
             context: context_json.and_then(|j| serde_json::from_str::<ContextMap>(&j).ok()),
             chunk_tokens: None,
             chunk_boundary: None,
+            section_level: None,
         },
     })
 }

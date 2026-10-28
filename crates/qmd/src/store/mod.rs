@@ -8,6 +8,7 @@ mod docs;
 mod fts;
 mod maintenance;
 mod schema;
+mod sections;
 mod vectors;
 
 pub use collections::CollectionStats;
@@ -19,6 +20,7 @@ pub use fts::{
     SearchResult, TermMatch, build_fts5_query, build_fts5_query_with, sanitize_fts5_term,
 };
 pub use maintenance::CleanupStats;
+pub use sections::{SectionRef, parse_section_id, section_id};
 pub use vectors::PendingEmbeddingDoc;
 
 use std::path::{Path, PathBuf};

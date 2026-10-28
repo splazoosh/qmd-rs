@@ -549,3 +549,92 @@ fn nearest_chunk_is_cut_with_the_geometry_its_vectors_were() {
     let chunk = stored.iter().find(|c| c.pos == top.best_chunk_pos).unwrap();
     assert_eq!(top.best_chunk, chunk.text);
 }
+
+#[test]
+fn section_documents_flow_through_vector_and_hybrid_search() {
+    use qmd::store::{hash_content, now_iso};
+
+    let store = qmd::Store::open_in_memory().unwrap();
+    let now = now_iso();
+    let long: String = (0..60)
+        .map(|i| {
+            format!(
+                "The animal walked on, step {i}. {}\n\n",
+                "On and on. ".repeat(10)
+            )
+        })
+        .collect();
+    let body = format!(
+        "# Field notes\n\n## Zebra\n\nA zebra grazed, striped and calm.\n\n\
+         ## Herd\n\n{long}## Weather\n\nRain all week.\n"
+    );
+    let hash = hash_content(&body);
+    store.insert_content(&hash, &body, &now).unwrap();
+    let mut coll = qmd::config::Collection::new("/s", "**/*.md");
+    coll.section_level = Some(2);
+    store.upsert_store_collection("s", &coll).unwrap();
+    store
+        .insert_document("s", "notes.md", "Field notes", &hash, &now, &now)
+        .unwrap();
+    store.sync_sections(None).unwrap();
+    let embedder = ConceptEmbedder;
+    generate_embeddings(&store, &embedder, &EmbedOptions::default()).unwrap();
+
+    let positions: Vec<i64> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT pos FROM content_vectors ORDER BY pos")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let sections = qmd::chunk::split_sections(&body, 2);
+    assert_eq!(sections.len(), 3);
+    assert!(positions.len() > 3, "the long section is embedded in parts");
+    for s in &sections {
+        assert!(
+            positions.contains(&(s.start as i64)),
+            "a part starts each section"
+        );
+    }
+
+    let striped = embedder_query(&embedder, "striped");
+    let hits = store.search_vec(&striped, 10, None).unwrap();
+    assert_eq!(hits[0].section.as_ref().unwrap().heading, "Zebra");
+    assert!(hits[0].body.starts_with("# Field notes\n\n## Zebra"));
+    let herd: Vec<_> = hits
+        .iter()
+        .filter(|h| h.section.as_ref().is_some_and(|s| s.heading == "Herd"))
+        .collect();
+    assert_eq!(herd.len(), 1, "a section's parts are one result");
+
+    let response = hybrid_query(
+        &store,
+        Some(&embedder),
+        None,
+        "zebra animal",
+        &HybridOptions::default(),
+    )
+    .unwrap();
+    let keys: Vec<String> = response.results.iter().map(|r| r.key()).collect();
+    assert!(keys.contains(&"qmd://s/notes.md#1".to_owned()));
+    assert!(keys.contains(&"qmd://s/notes.md#2".to_owned()));
+    for r in &response.results {
+        let s = r.section.as_ref().unwrap();
+        assert_eq!(r.body, &body[s.start..s.end]);
+        assert!(r.body.contains(&r.best_chunk));
+    }
+}
+
+fn embedder_query(embedder: &ConceptEmbedder, text: &str) -> Vec<f32> {
+    use qmd::embed::Embedder as _;
+    embedder
+        .embed(&qmd::embed::format_query_for_embedding(
+            text,
+            embedder.model_uri(),
+        ))
+        .unwrap()
+        .unwrap()
+}

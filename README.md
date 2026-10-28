@@ -14,6 +14,20 @@ size is its `chunkTokens` (default 900; `collection add --chunk-tokens`), and
 `chunkBoundary: heading` starts its chunks at headings. The
 SQLite schema is the TypeScript implementation's, so both can open one index.
 
+`sectionLevel: N` (1–6; `collection add --section-level N`, or
+`collection sections <name> [N]` on an existing one; omit N to switch back)
+makes each section of a file at heading level N its own document. BM25 ranks
+sections, vector search and fusion work over them, one file can give several
+results, and each result names its file, heading, line span and an identity
+`collection/path#K` that `get` fetches. A section runs from a heading of level N
+or shallower to the next one, so deeper headings stay inside it. Text before
+the first such heading is a section of its own. A file with no such heading is
+one section, the whole file. A heading with nothing under it joins the section
+after it. A section longer than the embedder takes in one input (1800 tokens)
+is split at paragraph boundaries for embedding only and stays one result.
+Switching a collection rebuilds its full-text rows and needs `qmd embed` to
+re-embed it. These tables exist only once a collection opts in.
+
 ## Build
 
 Requires Rust 1.96 or later and CMake; llama.cpp is compiled from source.

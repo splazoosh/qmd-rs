@@ -57,6 +57,17 @@ pub struct Collection {
         skip_serializing_if = "Option::is_none"
     )]
     pub chunk_boundary: Option<ChunkBoundary>,
+    /// Section documents: each section at this heading level (1-6) is its
+    /// own document to BM25, vector search and results, and its own chunk
+    /// ([`crate::chunk::split_sections`]). Overrides `chunkTokens` and
+    /// `chunkBoundary`. Changing it re-embeds the collection and rebuilds
+    /// its full-text rows; removing it restores file documents.
+    #[serde(
+        default,
+        rename = "sectionLevel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub section_level: Option<u8>,
 }
 
 pub fn default_pattern() -> String {
@@ -74,6 +85,7 @@ impl Collection {
             include_by_default: None,
             chunk_tokens: None,
             chunk_boundary: None,
+            section_level: None,
         }
     }
 
@@ -83,6 +95,9 @@ impl Collection {
 
     /// Chunk geometry for this collection.
     pub fn chunk_params(&self) -> ChunkParams {
+        if let Some(level) = self.section_level {
+            return ChunkParams::sections(level);
+        }
         self.chunk_tokens
             .map_or_else(ChunkParams::default, ChunkParams::for_size)
             .with_boundary(self.chunk_boundary.unwrap_or_default())

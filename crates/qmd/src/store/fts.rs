@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::store::Store;
+use crate::store::sections::{SectionRef, section_id};
 
 /// One BM25 search hit.
 #[derive(Debug, Clone)]
@@ -25,6 +26,20 @@ pub struct SearchResult {
     pub context: Option<String>,
     /// Normalized score in `[0, 1)`, higher is better.
     pub score: f64,
+    /// Set when the hit is one section of its file (a collection with
+    /// `sectionLevel`); `body` is then the section's text.
+    pub section: Option<SectionRef>,
+}
+
+impl SearchResult {
+    /// The hit's identity, which fusion and dedupe key on: the file's
+    /// virtual path, or for a section [`section_id`] of it.
+    pub fn key(&self) -> String {
+        match &self.section {
+            Some(s) => section_id(&self.filepath, s.seq),
+            None => self.filepath.clone(),
+        }
+    }
 }
 
 /// Keep letters, numbers, apostrophes, and underscores; lowercase. A term
@@ -251,17 +266,55 @@ impl Store {
             return Ok(Vec::new());
         };
 
+        let levels = self.section_levels()?;
+        let mut results = if levels.is_empty() {
+            self.search_documents_fts(&fts_query, limit, collection, false)?
+        } else {
+            let in_sections = |c: &str| levels.contains_key(c);
+            let mut results = Vec::new();
+            if collection.is_none_or(|c| !in_sections(c)) {
+                results = self.search_documents_fts(&fts_query, limit, collection, true)?;
+            }
+            if collection.is_none_or(in_sections) {
+                results.extend(self.search_sections_fts(&fts_query, limit, collection)?);
+                results.sort_by(|a, b| b.score.total_cmp(&a.score));
+                results.truncate(limit);
+            }
+            results
+        };
+        for r in &mut results {
+            r.context = self.context_for_file(&r.filepath)?;
+        }
+        Ok(results)
+    }
+
+    /// BM25 over `documents_fts`, one result per file. `skip_sections`
+    /// drops files of section collections, whose rows a TS trigger may have
+    /// re-added since the last section sync.
+    fn search_documents_fts(
+        &self,
+        fts_query: &str,
+        limit: usize,
+        collection: Option<&str>,
+        skip_sections: bool,
+    ) -> Result<Vec<SearchResult>> {
         let fts_limit = if collection.is_some() {
             limit.saturating_mul(10)
         } else {
             limit
         };
 
-        let collection_filter = if collection.is_some() {
-            " AND d.collection = ?2"
+        let mut collection_filter = if collection.is_some() {
+            " AND d.collection = ?2".to_owned()
         } else {
-            ""
+            String::new()
         };
+        if skip_sections {
+            collection_filter.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM store_config \
+                 WHERE key = 'section_level:' || d.collection)",
+            );
+        }
         let sql = format!(
             "WITH fts_matches AS (
                SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
@@ -300,6 +353,7 @@ impl Store {
                 collection_name: r.get(5)?,
                 context: None,
                 score: bm25.abs() / (1.0 + bm25.abs()),
+                section: None,
             })
         };
         let rows: Vec<SearchResult> = match collection {
@@ -310,12 +364,7 @@ impl Store {
                 .query_map(params![fts_query], map_row)?
                 .collect::<std::result::Result<_, _>>()?,
         };
-
-        let mut results = rows;
-        for r in &mut results {
-            r.context = self.context_for_file(&r.filepath)?;
-        }
-        Ok(results)
+        Ok(rows)
     }
 }
 

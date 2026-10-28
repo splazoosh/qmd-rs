@@ -168,6 +168,7 @@ fn sync_files(
     }
 
     result.orphaned_cleaned = store.cleanup_orphaned_content()?;
+    store.sync_sections(Some(collection_name))?;
     Ok(result)
 }
 

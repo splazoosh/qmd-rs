@@ -663,3 +663,71 @@ fn cleanup_removes_what_its_dry_run_reports() {
     let out = ok(dir, &["status"]);
     assert!(!out.contains("need embedding"), "{out}");
 }
+
+#[test]
+fn section_documents_reach_query_json_and_get() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ok(dir, &["init"]);
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("manual.md"),
+        "# Manual\n\n## Install\n\nRun the installer twice.\n\n\
+         ## Quorum\n\nA quorum is a majority of voters.\n",
+    )
+    .unwrap();
+    let out = ok(
+        dir,
+        &[
+            "collection",
+            "add",
+            "docs",
+            "--name",
+            "docs",
+            "--section-level",
+            "2",
+        ],
+    );
+    assert!(out.contains("Indexed: 1 new"), "{out}");
+    let out = ok(dir, &["collection", "show", "docs"]);
+    assert!(
+        out.contains("Sections: level 2, 2 sections in 1 files"),
+        "{out}"
+    );
+    ok(dir, &["embed"]);
+
+    let out = ok(dir, &["query", "quorum majority", "--format", "json"]);
+    let results: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let top = &results[0];
+    assert_eq!(top["file"], "docs/manual.md");
+    assert_eq!(top["section"]["id"], "docs/manual.md#2");
+    assert_eq!(top["section"]["heading"], "Quorum");
+    assert_eq!(top["section"]["start_line"], 7);
+    assert_eq!(top["line"], 9, "the line is the file's");
+    let out = ok(dir, &["search", "quorum", "--format", "files"]);
+    assert!(out.contains("docs/manual.md#2"), "{out}");
+    let out = ok(dir, &["query", "installer", "--full", "-n", "1"]);
+    assert!(out.contains("qmd://docs/manual.md#1"), "{out}");
+    assert!(out.contains("Section: ## Install (lines 1-5)"), "{out}");
+    assert!(
+        !out.contains("quorum is"),
+        "--full prints the section: {out}"
+    );
+
+    let out = ok(dir, &["get", "docs/manual.md#2"]);
+    assert!(out.starts_with("qmd://docs/manual.md#2"), "{out}");
+    assert!(
+        out.contains("A quorum is a majority") && !out.contains("installer"),
+        "{out}"
+    );
+    let out = ok(dir, &["get", "qmd://docs/manual.md#2:9"]);
+    assert!(out.contains("9: A quorum is a majority"), "{out}");
+    assert!(!out.contains("7: ## Quorum"), "{out}");
+    let out = ok(dir, &["get", "docs/manual.md"]);
+    assert!(out.contains("installer") && out.contains("quorum"), "{out}");
+
+    ok(dir, &["collection", "sections", "docs"]);
+    let out = ok(dir, &["search", "quorum", "--format", "files"]);
+    assert!(out.trim_end().ends_with("docs/manual.md"), "{out}");
+}

@@ -242,6 +242,10 @@ enum CollectionCommand {
         /// chunk at a heading with no overlap
         #[arg(long, value_name = "window|heading")]
         chunk_boundary: Option<qmd::chunk::ChunkBoundary>,
+        /// Make each section at this heading level (1-6) its own document:
+        /// search ranks and returns sections, not files
+        #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(1..=6))]
+        section_level: Option<u8>,
     },
     /// List all collections
     List,
@@ -277,6 +281,16 @@ enum CollectionCommand {
         /// The command; its words are joined with spaces
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Set the heading level (1-6) whose sections are the collection's
+    /// documents, or omit it to return to file documents. A change rebuilds
+    /// its full-text rows; run `qmd embed` to re-embed it
+    Sections {
+        /// Collection name
+        name: String,
+        /// Heading level
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=6))]
+        level: Option<u8>,
     },
     /// Include a collection in queries that name none
     Include {
@@ -335,6 +349,7 @@ fn main() {
                 ignore,
                 chunk_tokens,
                 chunk_boundary,
+                section_level,
             } => commands::collection_add(
                 &location,
                 &path,
@@ -343,6 +358,7 @@ fn main() {
                 &ignore,
                 chunk_tokens,
                 chunk_boundary,
+                section_level,
             ),
             CollectionCommand::List => commands::collection_list(&location),
             CollectionCommand::Remove { name } => commands::collection_remove(&location, &name),
@@ -352,6 +368,9 @@ fn main() {
             CollectionCommand::Show { name } => commands::collection_show(&location, &name),
             CollectionCommand::UpdateCmd { name, command } => {
                 commands::collection_update_cmd(&location, &name, &command.join(" "))
+            }
+            CollectionCommand::Sections { name, level } => {
+                commands::collection_sections(&location, &name, level)
             }
             CollectionCommand::Include { name } => {
                 commands::collection_include(&location, &name, true)

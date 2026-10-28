@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 
 use qmd::query::{Explain, HybridResult};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
-use qmd::store::SearchResult;
+use qmd::store::{SearchResult, SectionRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -79,6 +79,45 @@ pub struct ResultView<'a> {
     pub chunk_pos: Option<usize>,
     pub chunk_len: Option<usize>,
     pub explain: Option<&'a Explain>,
+    /// Set for a section hit, whose `body` is the section's text.
+    pub section: Option<&'a SectionRef>,
+}
+
+impl ResultView<'_> {
+    /// `collection/path`, with `#N` for a section.
+    fn path(&self) -> String {
+        match self.section {
+            Some(s) => qmd::store::section_id(self.display_path, s.seq),
+            None => self.display_path.to_owned(),
+        }
+    }
+
+    /// Lines before the body in its file.
+    fn line_offset(&self) -> usize {
+        self.section.map_or(0, |s| s.start_line - 1)
+    }
+}
+
+/// A section's heading for display; a section before any heading shows as
+/// `(lead)`.
+pub fn section_heading(s: &SectionRef) -> String {
+    if s.heading.is_empty() {
+        "(lead)".to_owned()
+    } else {
+        format!("{} {}", "#".repeat(usize::from(s.level)), s.heading)
+    }
+}
+
+/// The JSON form of a section hit: what `get` takes, its heading and its
+/// lines in the file.
+pub fn section_json(display_path: &str, s: &SectionRef) -> serde_json::Value {
+    serde_json::json!({
+        "id": qmd::store::section_id(display_path, s.seq),
+        "heading": s.heading,
+        "level": s.level,
+        "start_line": s.start_line,
+        "end_line": s.end_line,
+    })
 }
 
 impl<'a> From<&'a SearchResult> for ResultView<'a> {
@@ -93,6 +132,7 @@ impl<'a> From<&'a SearchResult> for ResultView<'a> {
             chunk_pos: None,
             chunk_len: None,
             explain: None,
+            section: r.section.as_ref(),
         }
     }
 }
@@ -109,6 +149,7 @@ impl<'a> From<&'a HybridResult> for ResultView<'a> {
             chunk_pos: Some(r.best_chunk_pos),
             chunk_len: Some(r.best_chunk.len()),
             explain: r.explain.as_ref(),
+            section: r.section.as_ref(),
         }
     }
 }
@@ -151,7 +192,8 @@ fn print_result_views(
                 .iter()
                 .map(|r| {
                     let snippet =
-                        extract_snippet_at(r.body, query, 300, r.chunk_pos, r.chunk_len, intent);
+                        extract_snippet_at(r.body, query, 300, r.chunk_pos, r.chunk_len, intent)
+                            .in_file(r.line_offset());
                     let mut obj = serde_json::Map::new();
                     obj.insert("docid".into(), format!("#{}", r.docid).into());
                     obj.insert(
@@ -161,6 +203,9 @@ fn print_result_views(
                     obj.insert("file".into(), r.display_path.into());
                     obj.insert("line".into(), serde_json::json!(snippet.line));
                     obj.insert("title".into(), r.title.into());
+                    if let Some(s) = r.section {
+                        obj.insert("section".into(), section_json(r.display_path, s));
+                    }
                     if let Some(ctx) = r.context {
                         obj.insert("context".into(), ctx.into());
                     }
@@ -193,7 +238,7 @@ fn print_result_views(
                     "#{},{:.2},{}{}",
                     r.docid,
                     r.score,
-                    csv_field(r.display_path),
+                    csv_field(&r.path()),
                     ctx
                 );
             }
@@ -202,7 +247,8 @@ fn print_result_views(
             let c = colors();
             for (i, r) in results.iter().enumerate() {
                 let snippet =
-                    extract_snippet_at(r.body, query, 500, r.chunk_pos, r.chunk_len, intent);
+                    extract_snippet_at(r.body, query, 500, r.chunk_pos, r.chunk_len, intent)
+                        .in_file(r.line_offset());
                 let snippet_body = snippet
                     .text
                     .split('\n')
@@ -221,10 +267,25 @@ fn print_result_views(
                 };
                 println!(
                     "{}qmd://{}{}{}{} {}#{}{}",
-                    c.cyan, r.display_path, c.dim, line_info, c.reset, c.dim, r.docid, c.reset
+                    c.cyan,
+                    r.path(),
+                    c.dim,
+                    line_info,
+                    c.reset,
+                    c.dim,
+                    r.docid,
+                    c.reset
                 );
                 if !r.title.is_empty() {
                     println!("{}Title: {}{}", c.bold, r.title, c.reset);
+                }
+                if let Some(s) = r.section {
+                    println!(
+                        "Section: {} (lines {}-{})",
+                        section_heading(s),
+                        s.start_line,
+                        s.end_line
+                    );
                 }
                 if let Some(ctx) = r.context {
                     println!("{}Context: {}{}", c.dim, ctx, c.reset);

@@ -58,10 +58,15 @@ impl Store {
             [],
         )?;
         tx.commit()?;
+        self.sync_sections(None)?;
 
-        self.conn().execute_batch(
-            "INSERT INTO documents_fts(documents_fts) VALUES('optimize'); VACUUM;",
-        )?;
+        self.conn()
+            .execute_batch("INSERT INTO documents_fts(documents_fts) VALUES('optimize');")?;
+        if !self.section_levels()?.is_empty() {
+            self.conn()
+                .execute_batch("INSERT INTO sections_fts(sections_fts) VALUES('optimize');")?;
+        }
+        self.conn().execute_batch("VACUUM;")?;
         Ok(CleanupStats {
             cached_scores,
             orphaned_vectors,

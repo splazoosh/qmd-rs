@@ -354,8 +354,9 @@ impl Store {
         let mut k = limit
             .saturating_mul(if collection.is_some() { 10 } else { 3 })
             .clamp(1, MAX_KNN_K);
+        let levels = self.section_levels()?;
         let best = loop {
-            let (fetched, best) = self.vec_candidates(query_embedding, k, collection)?;
+            let (fetched, best) = self.vec_candidates(query_embedding, k, collection, &levels)?;
             if best.len() >= limit || fetched < k || k == MAX_KNN_K {
                 break best;
             }
@@ -378,6 +379,7 @@ impl Store {
                 collection_name: row.collection_name,
                 body: row.body,
                 score: 1.0 - distance,
+                section: row.section,
             });
         }
         Ok(results)
@@ -434,13 +436,14 @@ impl Store {
     }
 
     /// The two steps of [`Self::search_vec`] for one `k`: returns how many
-    /// neighbours vec0 gave, and the surviving rows deduped by file (closest
-    /// chunk wins).
+    /// neighbours vec0 gave, and the surviving rows deduped by file, or by
+    /// section in a collection of `levels` (closest chunk wins).
     fn vec_candidates(
         &self,
         query_embedding: &[f32],
         k: usize,
         collection: Option<&str>,
+        levels: &HashMap<String, u8>,
     ) -> Result<(usize, BestByFile)> {
         let knn: Vec<(String, f64)> = {
             let mut stmt = self.conn().prepare(
@@ -473,7 +476,9 @@ impl Store {
                d.collection || '/' || d.path,
                d.title,
                d.collection,
-               content.doc
+               content.doc,
+               d.id,
+               cv.pos
              FROM content_vectors cv
              JOIN documents d ON d.hash = cv.hash AND d.active = 1
              JOIN content ON content.hash = d.hash
@@ -494,19 +499,30 @@ impl Store {
                 title: r.get(4)?,
                 collection_name: r.get(5)?,
                 body: r.get(6)?,
+                doc_id: r.get(7)?,
+                pos: r.get(8)?,
+                section: None,
             })
         })?;
 
         for row in rows {
-            let row = row?;
+            let mut row = row?;
+            let mut key = row.filepath.clone();
+            if levels.contains_key(&row.collection_name)
+                && let Some(section) = self.section_containing(row.doc_id, &row.hash, row.pos)?
+            {
+                key = super::section_id(&row.filepath, section.seq);
+                row.body = super::sections::slice_section(&row.body, section.start, section.end);
+                row.section = Some(section);
+            }
             let distance = distance_by_key
                 .get(row.hash_seq.as_str())
                 .copied()
                 .unwrap_or(1.0);
-            match best.get(&row.filepath) {
+            match best.get(&key) {
                 Some((_, existing)) if *existing <= distance => {}
                 _ => {
-                    best.insert(row.filepath.clone(), (row, distance));
+                    best.insert(key, (row, distance));
                 }
             }
         }
@@ -526,9 +542,13 @@ struct VecRow {
     title: String,
     collection_name: String,
     body: String,
+    doc_id: i64,
+    pos: i64,
+    section: Option<super::SectionRef>,
 }
 
-/// Rows keyed by file path, each with its closest chunk's distance.
+/// Rows keyed by file path (or section id), each with its closest chunk's
+/// distance.
 type BestByFile = HashMap<String, (VecRow, f64)>;
 
 #[cfg(test)]

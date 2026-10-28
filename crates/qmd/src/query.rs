@@ -17,7 +17,7 @@ use crate::embed::{Embedder, format_query_for_embedding};
 use crate::error::{Error, Result};
 use crate::rerank::{Reranker, blend, blend_fused_weight, rerank_cached};
 use crate::snippet::extract_intent_terms;
-use crate::store::{SearchResult, Store, TermMatch};
+use crate::store::{SearchResult, SectionRef, Store, TermMatch, section_id};
 
 /// Top normalized BM25 score required for the strong-signal bypass.
 pub const STRONG_SIGNAL_MIN_SCORE: f64 = 0.85;
@@ -239,7 +239,8 @@ pub fn validate_lex_query(query: &str) -> Option<String> {
 /// Fuse ranked result lists with RRF: each list contributes
 /// `weight / (k + rank + 1)` per document (rank 0-based), plus a top-rank
 /// bonus on the best rank across lists (rank 0 → +0.05, rank 1-2 → +0.02).
-/// Results are keyed by filepath and sorted by fused score.
+/// Results are keyed by [`SearchResult::key`] (the file, or one section of
+/// it) and sorted by fused score.
 pub fn reciprocal_rank_fusion(
     lists: &[Vec<SearchResult>],
     weights: &[f64],
@@ -257,11 +258,12 @@ pub fn reciprocal_rank_fusion(
         let weight = weights.get(list_idx).copied().unwrap_or(1.0);
         for (rank, result) in list.iter().enumerate() {
             let contribution = weight / (k + rank as f64 + 1.0);
-            if let Some(&i) = index.get(&result.filepath) {
+            let key = result.key();
+            if let Some(&i) = index.get(&key) {
                 entries[i].score += contribution;
                 entries[i].top_rank = entries[i].top_rank.min(rank);
             } else {
-                index.insert(result.filepath.clone(), entries.len());
+                index.insert(key, entries.len());
                 entries.push(Entry {
                     result: result.clone(),
                     score: contribution,
@@ -412,8 +414,8 @@ fn preview(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Per-file traces of [`reciprocal_rank_fusion`] over the same lists, keyed
-/// by filepath, with the RRF fields set and the rank and final fields left
+/// Per-result traces of [`reciprocal_rank_fusion`] over the same lists,
+/// keyed by [`SearchResult::key`], with the RRF fields set and the rank and final fields left
 /// for [`finalize_candidates`]. The sums run in fusion's order, so
 /// `rrf_score` equals the fused score exactly.
 fn rrf_traces(
@@ -433,7 +435,7 @@ fn rrf_traces(
                 backend_score: result.score,
                 rrf: weight / (k + rank as f64 + 1.0),
             };
-            let (trace, top_rank) = traces.entry(result.filepath.clone()).or_insert_with(|| {
+            let (trace, top_rank) = traces.entry(result.key()).or_insert_with(|| {
                 (
                     Explain {
                         contributions: Vec::new(),
@@ -576,6 +578,19 @@ pub struct HybridResult {
     pub docid: String,
     /// Set when [`HybridOptions::explain`] asked for it.
     pub explain: Option<Explain>,
+    /// Set when the hit is one section of its file; `body` is then the
+    /// section's text and `best_chunk_pos` an offset into it.
+    pub section: Option<SectionRef>,
+}
+
+impl HybridResult {
+    /// The file's virtual path, or for a section its [`section_id`].
+    pub fn key(&self) -> String {
+        match &self.section {
+            Some(s) => section_id(&self.filepath, s.seq),
+            None => self.filepath.clone(),
+        }
+    }
 }
 
 /// What the pipeline did, for CLI progress/debug output.
@@ -822,7 +837,7 @@ struct RerankInput<'a> {
 /// keyword overlap (intent terms at [`INTENT_WEIGHT_CHUNK`]), score — `1/rrf_rank`, or
 /// with a reranker the [`blend`] of that rank and the best rerank score among
 /// the [`RerankChunk`] chunks, reordered — then filter by `min_score` and
-/// slice to `limit`. Fused results are already unique per file. `traces`,
+/// slice to `limit`. Fused results are already unique per file or section. `traces`,
 /// when given, are completed and attached to the results they describe.
 fn finalize_candidates(
     store: &Store,
@@ -897,11 +912,16 @@ fn finalize_candidates(
         if rerank.is_some() {
             let mut offered = Vec::new();
             if let Some((embedding, n)) = nearest {
+                let (from, to) = cand
+                    .section
+                    .as_ref()
+                    .map_or((0, usize::MAX), |s| (s.start, s.end));
                 let positions: Vec<usize> = store
                     .chunk_distances(&cand.hash, embedding)?
                     .into_iter()
+                    .filter(|(pos, _)| (from..to).contains(pos))
                     .take(n)
-                    .map(|(pos, _)| pos)
+                    .map(|(pos, _)| pos - from)
                     .collect();
                 if !positions.is_empty() {
                     let params = store.vector_chunk_params(&cand.hash)?;
@@ -919,7 +939,7 @@ fn finalize_candidates(
 
         let explain = traces
             .as_mut()
-            .and_then(|t| t.remove(&cand.filepath))
+            .and_then(|t| t.remove(&cand.key()))
             .map(|mut trace| {
                 trace.rrf_rank = i + 1;
                 trace.position_score = 1.0 / (i as f64 + 1.0);
@@ -939,6 +959,7 @@ fn finalize_candidates(
             rrf_rank: i + 1,
             rerank_score: None,
             docid: cand.docid,
+            section: cand.section,
         });
     }
 
@@ -1011,6 +1032,7 @@ mod tests {
             body: String::new(),
             context: None,
             score,
+            section: None,
         }
     }
 

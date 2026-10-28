@@ -10,7 +10,7 @@ use qmd::query::{
 };
 use qmd::querylog::{self, Arm, Via};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
-use qmd::store::{DocumentLookup, DocumentResult, TermMatch};
+use qmd::store::{DocumentLookup, DocumentResult, SectionRef, TermMatch};
 use serde::{Deserialize, Serialize};
 
 use crate::worker::Index;
@@ -137,6 +137,10 @@ pub struct QueryHit {
     pub line: usize,
     /// The matching lines, with line numbers.
     pub snippet: String,
+    /// Present when the hit is one section of `file` (a collection with
+    /// `sectionLevel`); `line` and `snippet` then number the file's lines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<SectionHit>,
     /// The ranking trace, when `explain` asked for it: `contributions` (one
     /// per ranked list: `backend`, `kind`, `query`, `rank`, `weight`,
     /// `backend_score`, `rrf`), `rrf_base`, `rrf_bonus`, `rrf_score`,
@@ -144,6 +148,33 @@ pub struct QueryHit {
     /// `fused_weight`) and `final_score`, all unrounded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<serde_json::Value>,
+}
+
+/// Which section of its file a hit is.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct SectionHit {
+    /// `collection/path#N` — pass it to `get` for this section alone.
+    pub id: String,
+    /// The section's heading, without its `#` marks; empty for text before
+    /// the first heading.
+    pub heading: String,
+    /// The heading's level; 0 for text before the first heading.
+    pub level: u8,
+    /// First and last line of the section in the file.
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl SectionHit {
+    fn new(display_path: &str, s: &SectionRef) -> Self {
+        Self {
+            id: qmd::store::section_id(display_path, s.seq),
+            heading: s.heading.clone(),
+            level: s.level,
+            start_line: s.start_line,
+            end_line: s.end_line,
+        }
+    }
 }
 
 /// The `query` tool's structured content.
@@ -270,10 +301,15 @@ fn hit(r: &HybridResult, display_query: &str, intent: Option<&str>) -> QueryHit 
         Some(r.best_chunk_pos),
         Some(r.best_chunk.len()),
         intent,
-    );
+    )
+    .in_file(r.section.as_ref().map_or(0, |s| s.start_line - 1));
     QueryHit {
         docid: format!("#{}", r.docid),
         file: r.display_path.clone(),
+        section: r
+            .section
+            .as_ref()
+            .map(|s| SectionHit::new(&r.display_path, s)),
         title: r.title.clone(),
         score: (r.score * 100.0).round() / 100.0,
         context: r.context.clone(),
@@ -294,7 +330,11 @@ fn summarize(hits: &[QueryHit], traces: &[Option<String>], display_query: &str) 
     }
     let mut out = format!("{} results for: {display_query}\n", hits.len());
     for (h, trace) in hits.iter().zip(traces) {
-        out.push_str(&format!("\n{} {} ({:.2})\n", h.docid, h.file, h.score));
+        let file = h.section.as_ref().map_or(&h.file, |s| &s.id);
+        out.push_str(&format!("\n{} {file} ({:.2})\n", h.docid, h.score));
+        if let Some(s) = h.section.as_ref().filter(|s| !s.heading.is_empty()) {
+            out.push_str(&format!("Section: {}\n", s.heading));
+        }
         if let Some(context) = &h.context {
             out.push_str(&format!("Context: {context}\n"));
         }
@@ -317,7 +357,8 @@ fn resolve_collections(index: &Index, requested: Option<&[String]>) -> Result<Ve
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetParams {
-    /// File path or `#docid` from a search result. Accepts a line-range
+    /// File path or `#docid` from a search result, or a section's
+    /// `repo/doc.md#3` for that section alone. Accepts a line-range
     /// suffix: `repo/doc.md:100` starts at line 100, `repo/doc.md:100:40`
     /// (or `#abc123:100:40`) reads 40 lines from line 100.
     pub file: String,
@@ -348,11 +389,12 @@ pub fn get(index: &Index, params: &GetParams) -> Result<Document> {
     let (lookup, from, lines) = parse_range(&params.file, params.from_line, params.max_lines);
     let doc = find(index, &lookup, &params.file)?;
 
-    let start_line = from.unwrap_or(1);
+    let first_line = doc.section.as_ref().map_or(1, |s| s.start_line);
+    let start_line = from.unwrap_or(first_line).max(first_line);
     let mut text = doc.body.clone().unwrap_or_default();
     if from.is_some() || lines.is_some() {
         let all: Vec<&str> = text.split('\n').collect();
-        let start = start_line - 1;
+        let start = start_line - first_line;
         let end = lines.map_or(all.len(), |l| start.saturating_add(l).min(all.len()));
         text = all.get(start..end).unwrap_or_default().join("\n");
     }
@@ -385,9 +427,13 @@ fn document(doc: &DocumentResult, text: String) -> Document {
         Some(context) => format!("<!-- Context: {context} -->\n\n{text}"),
         None => text,
     };
+    let display_path = doc.section.as_ref().map_or_else(
+        || doc.display_path.clone(),
+        |s| qmd::store::section_id(&doc.display_path, s.seq),
+    );
     Document {
-        uri: format!("qmd://{}", doc.display_path),
-        display_path: doc.display_path.clone(),
+        uri: format!("qmd://{display_path}"),
+        display_path,
         title: doc.title.clone(),
         text,
     }
@@ -488,7 +534,7 @@ pub fn multi_get(index: &Index, params: &MultiGetParams) -> Result<Vec<MultiGetE
             }
         }
         if params.line_numbers.unwrap_or(true) {
-            text = add_line_numbers(&text, 1);
+            text = add_line_numbers(&text, doc.section.as_ref().map_or(1, |s| s.start_line));
         }
         entries.push(MultiGetEntry::Doc(Box::new(document(&doc, text))));
     }
@@ -525,8 +571,12 @@ fn resolve_pattern(
             }
         };
         for doc in found {
-            if !seen.contains(&doc.filepath) {
-                seen.push(doc.filepath.clone());
+            let key = doc.section.as_ref().map_or_else(
+                || doc.filepath.clone(),
+                |s| qmd::store::section_id(&doc.filepath, s.seq),
+            );
+            if !seen.contains(&key) {
+                seen.push(key);
                 docs.push(doc);
             }
         }

@@ -246,6 +246,7 @@ pub fn status(location: &IndexLocation) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn collection_add(
     location: &IndexLocation,
     path: &str,
@@ -254,6 +255,7 @@ pub fn collection_add(
     ignore: &[String],
     chunk_tokens: Option<usize>,
     chunk_boundary: Option<qmd::chunk::ChunkBoundary>,
+    section_level: Option<u8>,
 ) -> Result<()> {
     let resolved =
         std::fs::canonicalize(path).with_context(|| format!("directory not found: {path}"))?;
@@ -308,6 +310,7 @@ pub fn collection_add(
     }
     if let Some(c) = app.config.collections.get_mut(&coll_name) {
         c.chunk_boundary = chunk_boundary;
+        c.section_level = section_level;
     }
     config::save_config(&app.config_path, &app.config)?;
     app.store.sync_config_to_db(&app.config)?;
@@ -450,16 +453,52 @@ pub fn collection_show(location: &IndexLocation, name: &str) -> Result<()> {
     if let Some(context) = &coll.context {
         println!("  Contexts: {}", context.len());
     }
-    println!(
-        "  Chunks:   {} tokens, {} boundary",
-        params.size_tokens,
-        coll.chunk_boundary.unwrap_or_default().as_str()
-    );
+    match coll.section_level {
+        Some(level) => {
+            let (sections, files) = app
+                .store
+                .section_counts()?
+                .get(name)
+                .copied()
+                .unwrap_or_default();
+            println!(
+                "  Sections: level {level}, {sections} sections in {files} files (split for embedding past {} tokens)",
+                params.size_tokens
+            );
+        }
+        None => println!(
+            "  Chunks:   {} tokens, {} boundary",
+            params.size_tokens,
+            coll.chunk_boundary.unwrap_or_default().as_str()
+        ),
+    }
     if let Some(stats) = stats {
         println!("  Files:    {}", stats.active_count);
         if let Some(modified) = &stats.last_modified {
             println!("  Updated:  {modified}");
         }
+    }
+    Ok(())
+}
+
+pub fn collection_sections(location: &IndexLocation, name: &str, level: Option<u8>) -> Result<()> {
+    let mut app = open(location)?;
+    require_collection(&app, name)?;
+    let coll = app.config.collections.get_mut(name).expect("checked above");
+    if coll.section_level == level {
+        println!("Collection '{name}' already has that setting");
+        return Ok(());
+    }
+    coll.section_level = level;
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    match level {
+        Some(level) => println!(
+            "✓ Collection '{name}' now searches its level-{level} sections; run 'qmd embed' to re-embed it"
+        ),
+        None => println!(
+            "✓ Collection '{name}' now searches whole files; run 'qmd embed' to re-embed it"
+        ),
     }
     Ok(())
 }
@@ -1468,10 +1507,11 @@ pub fn get(
     };
 
     let mut output = doc.body.clone().unwrap_or_default();
-    let start_line = from.unwrap_or(1);
+    let first_line = doc.section.as_ref().map_or(1, |s| s.start_line);
+    let start_line = from.unwrap_or(first_line).max(first_line);
     if from.is_some() || lines.is_some() {
         let all_lines: Vec<&str> = output.split('\n').collect();
-        let start = start_line - 1;
+        let start = start_line - first_line;
         let end = lines
             .map(|l| start.saturating_add(l).min(all_lines.len()))
             .unwrap_or(all_lines.len());
@@ -1481,7 +1521,18 @@ pub fn get(
         output = format::numbered(&output, start_line);
     }
 
-    println!("qmd://{}  #{}", doc.display_path, doc.docid);
+    match &doc.section {
+        Some(s) => {
+            println!("qmd://{}#{}  #{}", doc.display_path, s.seq, doc.docid);
+            println!(
+                "Section: {} (lines {}-{})",
+                format::section_heading(s),
+                s.start_line,
+                s.end_line
+            );
+        }
+        None => println!("qmd://{}  #{}", doc.display_path, doc.docid),
+    }
     if let Some(ctx) = &doc.context {
         println!("Folder Context: {ctx}");
     }

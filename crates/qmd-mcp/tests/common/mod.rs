@@ -22,6 +22,12 @@ fn write(path: &Path, body: &str) {
 
 impl Fixture {
     pub fn build() -> Self {
+        Self::build_with(None)
+    }
+
+    /// The fixture with `recipes` set to section documents at `level`, and
+    /// a two-section `recipes/soup.md`.
+    pub fn build_with(recipe_sections: Option<u8>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -40,6 +46,12 @@ impl Fixture {
             &recipes.join("stock.md"),
             "# Chicken Stock\n\nSimmer bones for six hours; skim the surface.\n",
         );
+        if recipe_sections.is_some() {
+            write(
+                &recipes.join("soup.md"),
+                "# Soup\n\n## Broth\n\nStrain the broth.\n\n## Garnish\n\nChop the parsley finely.\n",
+            );
+        }
 
         let mut context = ContextMap::new();
         context.insert("sub".to_owned(), "baking notes".to_owned());
@@ -58,6 +70,7 @@ impl Fixture {
                 include_by_default: Some(true),
                 chunk_tokens: None,
                 chunk_boundary: None,
+                section_level: None,
             },
         );
         config.collections.insert(
@@ -71,6 +84,7 @@ impl Fixture {
                 include_by_default: Some(true),
                 chunk_tokens: None,
                 chunk_boundary: None,
+                section_level: recipe_sections,
             },
         );
 

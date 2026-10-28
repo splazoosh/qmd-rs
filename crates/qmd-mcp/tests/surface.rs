@@ -415,3 +415,36 @@ async fn the_resource_reads_a_document_and_reports_a_miss_as_content() {
 
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn section_documents_are_the_hits_and_get_reads_one() {
+    let fixture = Fixture::build_with(Some(2));
+    let (client, _) = connect(&fixture).await;
+
+    let found = call(
+        &client,
+        "query",
+        json!({ "query": "parsley", "collections": ["recipes"], "match": "all" }),
+    )
+    .await;
+    let top = found.structured_content.clone().unwrap()["results"][0].clone();
+    assert_eq!(top["file"], "recipes/soup.md");
+    assert_eq!(top["section"]["id"], "recipes/soup.md#2");
+    assert_eq!(top["section"]["heading"], "Garnish");
+    assert_eq!(top["section"]["start_line"], 7);
+    assert_eq!(top["line"], 9);
+    assert!(
+        top["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("9: Chop the parsley")
+    );
+    assert!(text_of(&found).contains("recipes/soup.md#2"));
+
+    let section = call(&client, "get", json!({ "file": "recipes/soup.md#2" })).await;
+    let text = text_of(&section);
+    assert!(text.contains("7: ## Garnish"), "{text}");
+    assert!(!text.contains("Broth"), "{text}");
+
+    client.cancel().await.unwrap();
+}

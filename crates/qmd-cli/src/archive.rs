@@ -337,5 +337,6 @@ pub fn index(location: &IndexLocation) -> Result<()> {
         &[],
         None,
         None,
+        None,
     )
 }

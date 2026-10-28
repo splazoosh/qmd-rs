@@ -88,6 +88,9 @@ pub fn embedding_fingerprint_for(model: &str, chunk: &ChunkParams) -> String {
     if chunk.boundary != ChunkBoundary::Window {
         significant.push(format!("chunk_boundary:{}", chunk.boundary.as_str()));
     }
+    if let Some(level) = chunk.section_level {
+        significant.push(format!("section_level:{level}"));
+    }
     let digest = Sha256::digest(significant.join("\n").as_bytes());
     hex::encode(digest)[..6].to_owned()
 }

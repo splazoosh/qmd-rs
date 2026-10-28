@@ -122,6 +122,7 @@ fn map_doc_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentResult> {
         body_length: r.get(6)?,
         body: r.get(7)?,
         context: None,
+        section: None,
     })
 }
 
@@ -140,6 +141,9 @@ pub struct DocumentResult {
     pub modified_at: String,
     pub body_length: i64,
     pub body: Option<String>,
+    /// Set when the lookup named one section (`path#N`); `body` and
+    /// `body_length` are then the section's.
+    pub section: Option<crate::store::SectionRef>,
 }
 
 /// Outcome of a `get` lookup.
@@ -312,8 +316,10 @@ impl Store {
         )?)
     }
 
-    /// Find a document's virtual path by short docid prefix.
-    pub fn find_document_by_docid(&self, docid_ref: &str) -> Result<Option<String>> {
+    /// The `(collection, path)` of a document by short docid prefix. A pair,
+    /// because a collection name may hold a `/` and make the virtual path
+    /// ambiguous.
+    fn docid_location(&self, docid_ref: &str) -> Result<Option<(String, String)>> {
         let short = normalize_docid(docid_ref);
         if short.is_empty() {
             return Ok(None);
@@ -322,12 +328,12 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT 'qmd://' || d.collection || '/' || d.path
+                "SELECT d.collection, d.path
                  FROM documents d
                  WHERE d.hash LIKE ?1 AND d.active = 1
                  LIMIT 1",
                 params![pattern],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
@@ -359,64 +365,93 @@ impl Store {
     }
 
     /// Find a document by virtual path, path suffix, collection-relative
-    /// path, or docid. Ported from TS `findDocument`.
+    /// path, or docid. Ported from TS `findDocument`. Any of these followed
+    /// by `#N` names section N of a file in a section collection. When the
+    /// whole input also finds a file, the reading whose match is more exact
+    /// wins, and the file on a tie (a [`PathMatch`] each).
     pub fn find_document(&self, query: &str, include_body: bool) -> Result<DocumentLookup> {
-        let mut filepath = match query.rfind(':') {
-            Some(i)
-                if query[i + 1..].chars().all(|c| c.is_ascii_digit())
-                    && !query[i + 1..].is_empty() =>
-            {
-                &query[..i]
+        let filepath = lookup_key(query);
+        if let Some((base, seq)) = crate::store::parse_section_id(&filepath)
+            && let Some((mut doc, base_match)) = self.match_file(base, true, PathMatch::Suffix)?
+            && let Some(path) = doc
+                .display_path
+                .strip_prefix(doc.collection_name.as_str())
+                .and_then(|p| p.strip_prefix('/'))
+            && let Some(section) = self.section_of_file(&doc.collection_name, path, seq)?
+        {
+            if let Some((file, _)) = self.match_file(&filepath, include_body, base_match)? {
+                return Ok(DocumentLookup::Found(file));
             }
-            _ => query,
+            let body = doc.body.take().unwrap_or_default();
+            let text = crate::store::sections::slice_section(&body, section.start, section.end);
+            doc.body_length = i64::try_from(text.len()).unwrap_or(i64::MAX);
+            doc.body = include_body.then_some(text);
+            doc.section = Some(section);
+            return Ok(DocumentLookup::Found(doc));
         }
-        .to_owned();
-        filepath = crate::store::normalize_path_separators(&filepath);
-
-        if is_docid(&filepath) {
-            match self.find_document_by_docid(&filepath)? {
-                Some(virtual_path) => filepath = virtual_path,
-                None => return Ok(DocumentLookup::NotFound { similar: vec![] }),
-            }
+        match self.match_file(&filepath, include_body, PathMatch::Suffix)? {
+            Some((doc, _)) => Ok(DocumentLookup::Found(doc)),
+            None if is_docid(&filepath) => Ok(DocumentLookup::NotFound { similar: vec![] }),
+            None => Ok(DocumentLookup::NotFound {
+                similar: self.find_similar_files(&filepath, 5, 5)?,
+            }),
         }
+    }
 
+    /// The file `filepath` (a [`lookup_key`]) names, and how it matched,
+    /// trying no match looser than `loosest`.
+    fn match_file(
+        &self,
+        filepath: &str,
+        include_body: bool,
+        loosest: PathMatch,
+    ) -> Result<Option<(Box<DocumentResult>, PathMatch)>> {
         let select = doc_select(include_body);
         let map_row = map_doc_row;
+        let pair_sql = format!("{select} WHERE d.collection = ?1 AND d.path = ?2 AND d.active = 1");
+        let by_pair = |collection: &str, path: &str| -> Result<Option<DocumentResult>> {
+            Ok(self
+                .conn()
+                .query_row(&pair_sql, params![collection, path], map_row)
+                .optional()?)
+        };
+        let in_collection = |display: &str| -> Result<Option<DocumentResult>> {
+            for (i, _) in display.match_indices('/') {
+                let found = by_pair(&display[..i], &display[i + 1..])?;
+                if found.is_some() {
+                    return Ok(found);
+                }
+            }
+            Ok(None)
+        };
+        let virtual_path = filepath.strip_prefix("qmd://");
 
-        let mut doc: Option<DocumentResult> = self
-            .conn()
-            .query_row(
-                &format!(
-                    "{select} WHERE 'qmd://' || d.collection || '/' || d.path = ?1 AND d.active = 1"
-                ),
-                params![filepath],
-                map_row,
-            )
-            .optional()?;
+        let mut doc = if is_docid(filepath) {
+            match self.docid_location(filepath)? {
+                Some((collection, path)) => by_pair(&collection, &path)?,
+                None => return Ok(None),
+            }
+        } else {
+            match virtual_path {
+                Some(display) => in_collection(display)?,
+                None => None,
+            }
+        };
 
-        if doc.is_none() && !filepath.starts_with("qmd://") {
-            let absolute = looks_absolute(&filepath);
+        if doc.is_none() && virtual_path.is_none() {
+            let absolute = looks_absolute(filepath);
             for named in self.store_collections()? {
                 let coll_path = crate::store::normalize_path_separators(&named.collection.path);
                 let coll_prefix = format!("{}/", coll_path.trim_end_matches('/'));
                 let relative = if let Some(rel) = filepath.strip_prefix(&coll_prefix) {
-                    Some(rel.to_owned())
+                    Some(rel)
                 } else if !absolute {
-                    Some(filepath.clone())
+                    Some(filepath)
                 } else {
                     None
                 };
                 if let Some(rel) = relative {
-                    doc = self
-                        .conn()
-                        .query_row(
-                            &format!(
-                                "{select} WHERE d.collection = ?1 AND d.path = ?2 AND d.active = 1"
-                            ),
-                            params![named.name, rel],
-                            map_row,
-                        )
-                        .optional()?;
+                    doc = by_pair(&named.name, rel)?;
                     if doc.is_some() {
                         break;
                     }
@@ -424,7 +459,13 @@ impl Store {
             }
         }
 
-        if doc.is_none() {
+        if doc.is_none() && virtual_path.is_none() {
+            doc = in_collection(filepath)?;
+        }
+        let mut matched = PathMatch::Exact;
+
+        if doc.is_none() && loosest == PathMatch::Suffix {
+            matched = PathMatch::Suffix;
             doc = self
                 .conn()
                 .query_row(
@@ -433,21 +474,17 @@ impl Store {
                          AND d.active = 1 \
                          ORDER BY LENGTH(d.path), d.collection, d.path LIMIT 1"
                     ),
-                    params![format!("%/{}", escape_like(&filepath))],
+                    params![format!("%/{}", escape_like(filepath))],
                     map_row,
                 )
                 .optional()?;
         }
 
-        match doc {
-            Some(mut d) => {
-                d.context = self.context_for_file(&d.filepath)?;
-                Ok(DocumentLookup::Found(Box::new(d)))
-            }
-            None => Ok(DocumentLookup::NotFound {
-                similar: self.find_similar_files(&filepath, 5, 5)?,
-            }),
-        }
+        let Some(mut d) = doc else {
+            return Ok(None);
+        };
+        d.context = self.context_for_file(&d.filepath)?;
+        Ok(Some((Box::new(d), matched)))
     }
 
     /// Active documents whose path matches `pattern`, ordered by path.
@@ -531,6 +568,29 @@ fn escape_like(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// How a lookup matched a file; `Exact` sorts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PathMatch {
+    /// A docid, `qmd://` path, collection-relative or absolute path, or
+    /// `collection/path`.
+    Exact,
+    /// The trailing segments of a longer path.
+    Suffix,
+}
+
+/// A lookup input without its trailing `:line`, with `/` separators.
+fn lookup_key(query: &str) -> String {
+    let filepath = match query.rfind(':') {
+        Some(i)
+            if query[i + 1..].chars().all(|c| c.is_ascii_digit()) && !query[i + 1..].is_empty() =>
+        {
+            &query[..i]
+        }
+        _ => query,
+    };
+    crate::store::normalize_path_separators(filepath)
 }
 
 /// Absolute on this platform, rooted at `/`, or starting with a drive letter
@@ -634,6 +694,7 @@ mod tests {
             include_by_default: None,
             chunk_tokens: None,
             chunk_boundary: None,
+            section_level: None,
         };
         store.upsert_store_collection("c", &coll).unwrap();
         add_doc(&store, "c", "x/sub/a.md");
@@ -653,6 +714,45 @@ mod tests {
         assert_eq!(found(&store, "a.md").as_deref(), Some("c/sub/a.md"));
         assert_eq!(found(&store, "y_a.md"), None);
         assert_eq!(found(&store, "my_a.md").as_deref(), Some("c/my_a.md"));
+    }
+
+    #[test]
+    fn find_document_reaches_a_collection_whose_name_holds_a_slash() {
+        let store = Store::open_in_memory().unwrap();
+        add_doc(&store, "team/notes", "a.md");
+        add_doc(&store, "team", "other.md");
+        let id = docid(&hash_content("# a.md\nteam/notes\n"));
+        for query in ["qmd://team/notes/a.md", "team/notes/a.md", id.as_str()] {
+            assert_eq!(
+                found(&store, query).as_deref(),
+                Some("team/notes/a.md"),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docid_resolves_its_own_document_when_display_paths_collide() {
+        let store = Store::open_in_memory().unwrap();
+        add_doc(&store, "a", "b/x");
+        add_doc(&store, "a/b", "x");
+        for (collection, path) in [("a", "b/x"), ("a/b", "x")] {
+            let id = docid(&hash_content(&format!("# {path}\n{collection}\n")));
+            match store.find_document(&id, false).unwrap() {
+                DocumentLookup::Found(d) => assert_eq!(d.collection_name, collection),
+                DocumentLookup::NotFound { .. } => panic!("{id} not found"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_docid_miss_suggests_no_similar_files() {
+        let store = Store::open_in_memory().unwrap();
+        add_doc(&store, "c", "abcdef.md");
+        match store.find_document("abcdef0", false).unwrap() {
+            DocumentLookup::NotFound { similar } => assert!(similar.is_empty()),
+            DocumentLookup::Found(d) => panic!("found {}", d.display_path),
+        }
     }
 
     #[test]

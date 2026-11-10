@@ -1,4 +1,4 @@
-//! The MCP server: four tools, one resource template, and instructions built
+//! The MCP server: five tools, one resource template, and instructions built
 //! from the live index.
 
 use std::sync::{Arc, PoisonError, RwLock};
@@ -13,7 +13,9 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::tools::{self, Document, GetParams, MultiGetEntry, MultiGetParams, QueryParams};
+use crate::tools::{
+    self, Document, GetParams, MetadataParams, MultiGetEntry, MultiGetParams, QueryParams,
+};
 use crate::worker::{Index, Worker};
 
 /// URI template for the document resource.
@@ -189,6 +191,43 @@ impl QmdServer {
                     Err(e) => return tool_error(&anyhow::anyhow!(e)),
                 };
                 let mut result = CallToolResult::success(vec![ContentBlock::text(summary)]);
+                result.structured_content = Some(structured);
+                result
+            }
+            Err(e) => tool_error(&e),
+        }
+    }
+
+    #[tool(
+        name = "metadata",
+        description = "Discover which metadata keys the indexed documents declare, what types \
+                       they hold, and how many documents share each value, so a `filter` for \
+                       `query` is written from what is indexed instead of guessed. `filter` \
+                       selects which documents are counted; `match` selects which of their \
+                       metadata entries are reported. Both take query's filter AST; in \
+                       `match` a condition's field is \"key\" or \"value\" and `exists` and \
+                       `all` do not apply. Examples of `match`: \
+                       {\"field\":\"key\",\"operator\":\"eq\",\"value\":\"topics\"} (one key), \
+                       {\"field\":\"key\",\"operator\":\"prefix\",\"value\":\"mem-\"} (a family), \
+                       {\"field\":\"value\",\"operator\":\"eq\",\"value\":\"docs-team\"} (which \
+                       keys hold a value). Counts are documents, not values. `keys` is one \
+                       window of `totalKeys` in coverage order with `remainingKeys` after it; \
+                       each key splits by type (a key may hold numbers in some files and \
+                       strings in others), each type with its `documents`, `distinctValues`, a \
+                       window of `values`, `remainingValues` and, for numbers, `range`. With a \
+                       `filter` the result reports `filteredDocuments`, the denominator of \
+                       every coverage count. Every value reported matches \
+                       {field: '<key>', operator: 'eq', value} under the same collections.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn metadata(&self, Parameters(params): Parameters<MetadataParams>) -> CallToolResult {
+        match self
+            .worker
+            .run(move |index: &mut Index| tools::metadata(index, &params))
+            .await
+        {
+            Ok((structured, text)) => {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 result.structured_content = Some(structured);
                 result
             }

@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::chunk::split_sections;
 use crate::error::Result;
+use crate::store::fts::Scope;
 use crate::store::{SearchResult, Store};
 
 /// `store_config` key prefix of a collection's section level.
@@ -272,32 +273,26 @@ impl Store {
     }
 
     /// BM25 over `sections_fts`: one result per section, its text the body.
+    /// A metadata filter tests the section's file, so it admits or rejects
+    /// every section of a file together.
     pub(crate) fn search_sections_fts(
         &self,
         fts_query: &str,
         limit: usize,
-        collection: Option<&str>,
+        scope: &Scope<'_>,
     ) -> Result<Vec<SearchResult>> {
         if !self.sections_table_exists()? {
             return Ok(Vec::new());
         }
-        let fts_limit = if collection.is_some() {
-            limit.saturating_mul(10)
-        } else {
-            limit
-        };
-        let collection_filter = if collection.is_some() {
-            " AND d.collection = ?2"
-        } else {
-            ""
-        };
+        let fts_limit = scope.fts_limit(limit);
+        let (collection_filter, params) = scope.where_sql(fts_query);
         let sql = format!(
             "WITH fts_matches AS (
                SELECT rowid, bm25(sections_fts, 1.5, 4.0, 1.0) as bm25_score
                FROM sections_fts
                WHERE sections_fts MATCH ?1
                ORDER BY bm25_score ASC
-               LIMIT {fts_limit}
+               {fts_limit}
              )
              SELECT
                'qmd://' || d.collection || '/' || d.path,
@@ -331,14 +326,9 @@ impl Store {
                 section: Some(section),
             })
         };
-        let rows: Vec<SearchResult> = match collection {
-            Some(c) => stmt
-                .query_map(params![fts_query, c], map_row)?
-                .collect::<std::result::Result<_, _>>()?,
-            None => stmt
-                .query_map(params![fts_query], map_row)?
-                .collect::<std::result::Result<_, _>>()?,
-        };
+        let rows: Vec<SearchResult> = stmt
+            .query_map(rusqlite::params_from_iter(params), map_row)?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
 

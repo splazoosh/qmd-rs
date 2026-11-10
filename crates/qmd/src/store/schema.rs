@@ -75,6 +75,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
+    super::metadata::initialize_schema(conn)?;
+
     apply_fts_sync_triggers(conn)?;
     Ok(())
 }

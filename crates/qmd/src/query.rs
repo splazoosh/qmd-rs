@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::chunk::{Chunk, chunk_document_for, token_chunks_at};
 use crate::embed::{Embedder, format_query_for_embedding};
 use crate::error::{Error, Result};
+use crate::metadata::MetadataFilter;
 use crate::rerank::{Reranker, blend, blend_fused_weight, rerank_cached};
 use crate::snippet::extract_intent_terms;
 use crate::store::{SearchResult, SectionRef, Store, TermMatch, section_id};
@@ -486,6 +487,9 @@ pub struct HybridOptions {
     pub rerank_chunk: RerankChunk,
     /// Attach an [`Explain`] trace to each result.
     pub explain: bool,
+    /// Restrict every BM25 and vector list to documents this admits, before
+    /// fusion and rerank, so every result satisfies it.
+    pub filter: Option<MetadataFilter>,
 }
 
 impl Default for HybridOptions {
@@ -499,6 +503,7 @@ impl Default for HybridOptions {
             term_match: TermMatch::default(),
             rerank_chunk: RerankChunk::default(),
             explain: false,
+            filter: None,
         }
     }
 }
@@ -637,7 +642,7 @@ pub fn hybrid_query(
     let mut report = HybridReport::default();
 
     let initial_fts = ranked_list(collections, |k, c| {
-        store.search_fts_with(query, k, c, options.term_match)
+        store.search_fts_filtered(query, k, c, options.term_match, options.filter.as_ref())
     })?;
     let top_score = initial_fts.first().map_or(0.0, |r| r.score);
     let second_score = initial_fts.get(1).map_or(0.0, |r| r.score);
@@ -669,8 +674,9 @@ pub fn hybrid_query(
             let formatted = format_query_for_embedding(query, embedder.model_uri());
             if let Some(embedding) = embedder.embed(&formatted)? {
                 report.queries_embedded = 1;
-                let vec_results =
-                    ranked_list(collections, |k, c| store.search_vec(&embedding, k, c))?;
+                let vec_results = ranked_list(collections, |k, c| {
+                    store.search_vec_filtered(&embedding, k, c, options.filter.as_ref())
+                })?;
                 if !vec_results.is_empty() {
                     lists.push(vec_results);
                     weights.push(2.0);
@@ -744,7 +750,13 @@ pub fn structured_search(
     for search in searches {
         if search.query_type == QueryType::Lex {
             let fts_results = ranked_list(collections, |k, c| {
-                store.search_fts_with(&search.query, k, c, options.term_match)
+                store.search_fts_filtered(
+                    &search.query,
+                    k,
+                    c,
+                    options.term_match,
+                    options.filter.as_ref(),
+                )
             })?;
             if !fts_results.is_empty() {
                 lists.push(fts_results);
@@ -768,8 +780,9 @@ pub fn structured_search(
             let mut embeddings = embedder.embed_batch(&texts)?;
             for (search, embedding) in vec_searches.iter().zip(&embeddings) {
                 let Some(embedding) = embedding else { continue };
-                let vec_results =
-                    ranked_list(collections, |k, c| store.search_vec(embedding, k, c))?;
+                let vec_results = ranked_list(collections, |k, c| {
+                    store.search_vec_filtered(embedding, k, c, options.filter.as_ref())
+                })?;
                 if !vec_results.is_empty() {
                     lists.push(vec_results);
                     sources.push(typed(Backend::Vec, search));

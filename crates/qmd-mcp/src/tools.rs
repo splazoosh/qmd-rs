@@ -1,10 +1,11 @@
-//! The four tools: `query`, `get`, `multi_get`, `status`.
+//! The five tools: `query`, `get`, `multi_get`, `status`, `metadata`.
 //!
 //! Each runs on the index thread (see [`crate::worker`]) and returns the rows
 //! the CLI would: a text summary alongside structured content, as the
 //! TypeScript server does.
 
 use anyhow::{Result, anyhow, bail};
+use qmd::metadata::MetadataFilter;
 use qmd::query::{
     HybridOptions, HybridResult, QueryType, TypedQuery, hybrid_query, structured_search,
 };
@@ -102,6 +103,30 @@ pub struct QueryParams {
     /// blend when reranking ran (default: false). Changes no ranking.
     #[serde(default)]
     pub explain: Option<bool>,
+    /// Metadata filter (recursive JSON AST); every returned result satisfies
+    /// it. Nodes are operator-discriminated: groups {operator:'and'|'or',
+    /// operands:[...]}, negation {operator:'not', operand:{...}}, and
+    /// conditions {field, operator, value} with eq/ne/gt/gte/lt/lte
+    /// (comparison), in/nin/all (membership), contains/prefix/suffix (text),
+    /// type (value 'string'|'number'|'boolean') and exists (presence).
+    /// Values are typed exactly (no coercion); a missing key matches neither
+    /// ne nor nin. A condition with a string value may add
+    /// caseInsensitive:true (ASCII folding). Call `metadata` to see the keys
+    /// and values indexed. Example: {"operator":"and","operands":[{"field":
+    /// "topics","operator":"all","value":["typescript"]},{"field":"status",
+    /// "operator":"ne","value":"draft"}]}
+    #[serde(default)]
+    pub filter: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Parse a `filter` argument.
+fn parse_filter(
+    filter: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<MetadataFilter>> {
+    filter
+        .map(|f| MetadataFilter::parse(&serde_json::Value::Object(f.clone())))
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))
 }
 
 /// BM25 term combination for `query`.
@@ -141,6 +166,9 @@ pub struct QueryHit {
     /// `sectionLevel`); `line` and `snippet` then number the file's lines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<SectionHit>,
+    /// The document's indexed `qmd.metadata`, when it has any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     /// The ranking trace, when `explain` asked for it: `contributions` (one
     /// per ranked list: `backend`, `kind`, `query`, `rank`, `weight`,
     /// `backend_score`, `rrf`), `rrf_base`, `rrf_bonus`, `rrf_score`,
@@ -202,6 +230,7 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
         bail!("at most 10 sub-queries ({} given)", searches.len());
     }
 
+    let filter = parse_filter(params.filter.as_ref())?;
     let names = resolve_collections(index, params.collections.as_deref())?;
 
     let typed: Vec<TypedQuery> = searches
@@ -230,6 +259,7 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
             .or(settings.term_match)
             .unwrap_or_default(),
         explain: params.explain.unwrap_or(false),
+        filter,
         ..HybridOptions::default()
     };
 
@@ -268,9 +298,18 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
     let mut results = response.results;
     results.truncate(options.limit);
 
+    let paths: Vec<String> = results.iter().map(|r| r.filepath.clone()).collect();
+    let metadata = store.metadata_by_filepath(&paths)?;
     let hits: Vec<QueryHit> = results
         .iter()
-        .map(|r| hit(r, &display_query, params.intent.as_deref()))
+        .map(|r| {
+            let mut h = hit(r, &display_query, params.intent.as_deref());
+            h.metadata = metadata
+                .get(&r.filepath)
+                .filter(|m| !m.is_empty())
+                .map(|m| serde_json::to_value(m).expect("metadata serializes"));
+            h
+        })
         .collect();
     let traces: Vec<Option<String>> = results
         .iter()
@@ -315,6 +354,7 @@ fn hit(r: &HybridResult, display_query: &str, intent: Option<&str>) -> QueryHit 
         context: r.context.clone(),
         line: snippet.line,
         snippet: snippet.numbered(),
+        metadata: None,
         explain: r
             .explain
             .as_ref()
@@ -584,17 +624,138 @@ fn resolve_pattern(
     Ok(docs)
 }
 
+/// Order of values within a key.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SortParam {
+    /// Document count descending (default).
+    Count,
+    /// Value ascending.
+    Value,
+}
+
+/// Arguments to `metadata`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataParams {
+    /// Restrict to these collections (default: the collections `query`
+    /// searches).
+    #[serde(default)]
+    pub collections: Option<Vec<String>>,
+    /// Report only metadata entries matching this condition: the `filter`
+    /// AST, evaluated per entry, where a condition's field is 'key' (the
+    /// entry's key name) or 'value' (its value). Default: every entry.
+    /// Example: {"field":"key","operator":"eq","value":"topics"}
+    #[serde(default, rename = "match")]
+    pub r#match: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Count only documents this metadata filter admits; the AST of
+    /// `query`'s `filter`. Example: {"field":"status","operator":"eq",
+    /// "value":"published"}
+    #[serde(default)]
+    pub filter: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Keys reported (default: 50); `remainingKeys` says how many follow.
+    #[serde(default)]
+    pub key_limit: Option<u64>,
+    /// Keys skipped before the window, in report order (default: 0).
+    #[serde(default)]
+    pub key_offset: Option<u64>,
+    /// Values reported per key and type (default: 10); `remainingValues`
+    /// says how many follow.
+    #[serde(default)]
+    pub value_limit: Option<u64>,
+    /// Values skipped per key and type before the window, in `sort` order
+    /// (default: 0).
+    #[serde(default)]
+    pub value_offset: Option<u64>,
+    /// Order values by document count descending (default) or by value.
+    #[serde(default)]
+    pub sort: Option<SortParam>,
+    /// Hide values held by fewer documents than this (default: 1).
+    #[serde(default)]
+    pub min_count: Option<u64>,
+}
+
+/// Report metadata keys, types and per-value document counts, as
+/// `qmd collection metadata` does: the report as structured content and
+/// its text rendering.
+///
+/// # Errors
+/// Fails on an unknown collection, an invalid filter or match, an option
+/// outside its domain, and a filter and match over the binding budget.
+pub fn metadata(index: &Index, params: &MetadataParams) -> Result<(serde_json::Value, String)> {
+    use qmd::metadata::format::{Colors, FormatOptions, format_key_summaries};
+    use qmd::metadata::report::{Limit, ValueSort};
+    use qmd::metadata::{ListMetadataOptions, MetadataMatch};
+
+    let r#match = params
+        .r#match
+        .as_ref()
+        .map(|m| MetadataMatch::parse(&serde_json::Value::Object(m.clone())))
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))?;
+    let filter = parse_filter(params.filter.as_ref())?;
+    let names = resolve_collections(index, params.collections.as_deref())?;
+    let options = ListMetadataOptions {
+        collections: (!names.is_empty()).then(|| names.clone()),
+        r#match,
+        filter,
+        key_limit: params.key_limit.map(Limit::At),
+        key_offset: params.key_offset,
+        value_limit: params.value_limit.map(Limit::At),
+        value_offset: params.value_offset,
+        sort: match params.sort {
+            Some(SortParam::Value) => ValueSort::Value,
+            _ => ValueSort::Count,
+        },
+        min_count: params.min_count,
+    };
+    let result = index.store.list_metadata(&options)?;
+    let text = format_key_summaries(
+        &result,
+        &FormatOptions {
+            show_collections: names.len() != 1,
+            value_window_hint: "a higher 'valueLimit' or a 'valueOffset'",
+            key_window_hint: "a higher 'keyLimit' or a 'keyOffset'",
+            key_offset: params.key_offset.unwrap_or(0),
+            key_offset_label: "keyOffset",
+            empty_message: "No metadata matches. Call without match/filter to see which keys \
+                            exist, or check the status tool for collections with metadata.",
+            colors: Colors::NONE,
+        },
+    );
+    Ok((serde_json::to_value(&result)?, text))
+}
+
+/// The most covered metadata keys `status` names per collection.
+const STATUS_METADATA_KEYS: u64 = 10;
+
+/// One metadata key in `status` output.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct MetadataKeyStatus {
+    pub key: String,
+    /// Documents declaring it.
+    pub documents: u64,
+    /// The types its documents hold, most common first; more than one is a
+    /// type conflict.
+    pub types: Vec<String>,
+}
+
 /// One collection in `status` output.
 ///
 /// Deliberately carries no filesystem path: TS prints `col.path` per
 /// collection, which across many collections would spell a machine's
 /// directory layout into text a model reads and may quote.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectionStatus {
     pub name: String,
     /// The glob the collection indexes, e.g. `**/*.md`.
     pub pattern: String,
     pub documents: i64,
+    /// Distinct `qmd.metadata` keys its documents declare.
+    pub metadata_key_count: u64,
+    /// Its most covered keys, by coverage.
+    pub metadata_keys: Vec<MetadataKeyStatus>,
 }
 
 /// The `status` tool's structured content.
@@ -605,6 +766,15 @@ pub struct StatusOutput {
     pub embedded_chunks: i64,
     pub needs_embedding: usize,
     pub has_vector_index: bool,
+    /// Active documents without a current metadata extraction, which a
+    /// `filter` cannot see until `qmd update` runs.
+    pub pending_metadata: u64,
+    /// Active documents whose frontmatter failed extraction, which a `filter`
+    /// cannot see until the file is fixed.
+    pub invalid_metadata: u64,
+    /// Why vector search is failing in this server, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedder_error: Option<String>,
     pub collections: Vec<CollectionStatus>,
 }
 
@@ -626,15 +796,31 @@ pub fn status(index: &Index) -> Result<(StatusOutput, String)> {
             .query_row("SELECT COUNT(*) FROM content_vectors", [], |r| r.get(0))?;
     let needs_embedding = store.pending_embedding_docs(None, &index.model)?.len();
     let has_vector_index = store.vec_table_exists()? && embedded_chunks > 0;
+    let mut overviews = store.metadata_overviews(Some(STATUS_METADATA_KEYS))?;
     let collections: Vec<CollectionStatus> = store
         .list_collections_with_stats()?
         .into_iter()
-        .map(|c| CollectionStatus {
-            name: c.name,
-            pattern: c.pattern,
-            documents: c.active_count,
+        .map(|c| {
+            let overview = overviews.remove(&c.name).unwrap_or_default();
+            CollectionStatus {
+                metadata_key_count: overview.total_keys,
+                metadata_keys: overview
+                    .keys
+                    .into_iter()
+                    .map(|k| MetadataKeyStatus {
+                        key: k.key,
+                        documents: k.documents,
+                        types: k.types.iter().map(|t| t.as_str().to_owned()).collect(),
+                    })
+                    .collect(),
+                name: c.name,
+                pattern: c.pattern,
+                documents: c.active_count,
+            }
         })
         .collect();
+    let pending_metadata = store.count_documents_pending_metadata(None)?;
+    let invalid_metadata = store.count_metadata_failures(None)?;
 
     let mut summary = format!(
         "QMD index status:\n  Documents: {total_documents}\n  Embedded chunks: \
@@ -652,6 +838,44 @@ pub fn status(index: &Index) -> Result<(StatusOutput, String)> {
             "\n    - {}: {} documents ({})",
             c.name, c.documents, c.pattern
         ));
+        if !c.metadata_keys.is_empty() {
+            let labels: Vec<String> = c
+                .metadata_keys
+                .iter()
+                .map(|k| format!("{} ({})", k.key, k.types.join(" | ")))
+                .collect();
+            let hidden = c
+                .metadata_key_count
+                .saturating_sub(c.metadata_keys.len() as u64);
+            let more = if hidden > 0 {
+                format!(", +{hidden} more")
+            } else {
+                String::new()
+            };
+            summary.push_str(&format!(
+                "\n      metadata keys: {}{more}",
+                labels.join(", ")
+            ));
+        }
+    }
+    if collections.iter().any(|c| !c.metadata_keys.is_empty()) {
+        summary.push_str(
+            "\n  Metadata: call the 'metadata' tool to see values and counts before writing a 'filter'",
+        );
+    }
+    if pending_metadata > 0 {
+        summary.push_str(&format!(
+            "\n  Pending metadata extraction: {pending_metadata} (excluded from filtered results until 'qmd update')"
+        ));
+    }
+    if invalid_metadata > 0 {
+        summary.push_str(&format!(
+            "\n  Invalid frontmatter: {invalid_metadata} (excluded from filtered results until fixed; 'qmd collection metadata --errors' names them)"
+        ));
+    }
+    let embedder_error = index.health().failure();
+    if let Some(error) = &embedder_error {
+        summary.push_str(&format!("\n  Embedder: {error}"));
     }
     Ok((
         StatusOutput {
@@ -659,6 +883,9 @@ pub fn status(index: &Index) -> Result<(StatusOutput, String)> {
             embedded_chunks,
             needs_embedding,
             has_vector_index,
+            pending_metadata,
+            invalid_metadata,
+            embedder_error,
             collections,
         },
         summary,

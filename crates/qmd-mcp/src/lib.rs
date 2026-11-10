@@ -8,6 +8,7 @@
 //! the SQLite connection nor the embedder is `Sync`. Nothing in the `qmd`
 //! library is async.
 
+pub mod health;
 pub mod http;
 pub mod instructions;
 pub mod server;
@@ -19,9 +20,10 @@ use std::path::Path;
 use anyhow::Result;
 use rmcp::ServiceExt as _;
 
+pub use health::EmbedderHealth;
 pub use http::HttpServer;
 pub use server::QmdServer;
-pub use worker::{EmbedderFactory, Factories, Index, RerankerFactory, Worker};
+pub use worker::{EmbedderFactory, Factories, Index, Relaunch, RerankerFactory, Worker};
 
 /// Serve MCP over stdin/stdout until the client disconnects.
 ///

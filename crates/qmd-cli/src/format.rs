@@ -1,8 +1,10 @@
 //! Output formatting: cli / json / files, ported from the TS formatter and
 //! `outputResults`.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 
+use qmd::metadata::DocumentMetadata;
 use qmd::query::{Explain, HybridResult};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
 use qmd::store::{SearchResult, SectionRef};
@@ -59,6 +61,18 @@ pub fn colors() -> Colors {
     }
 }
 
+impl Colors {
+    /// The subset metadata reports print with.
+    pub fn metadata(&self) -> qmd::metadata::format::Colors {
+        qmd::metadata::format::Colors {
+            reset: self.reset,
+            dim: self.dim,
+            bold: self.bold,
+            cyan: self.cyan,
+        }
+    }
+}
+
 pub fn print_empty_results(format: OutputFormat) {
     match format {
         OutputFormat::Json => println!("[]"),
@@ -70,6 +84,8 @@ pub fn print_empty_results(format: OutputFormat) {
 /// Common shape for search/vsearch/query output rows. Hybrid results carry
 /// a best-chunk hint that focuses snippet extraction.
 pub struct ResultView<'a> {
+    /// `qmd://collection/path`, the key of the metadata map.
+    pub filepath: &'a str,
     pub docid: &'a str,
     pub display_path: &'a str,
     pub title: &'a str,
@@ -123,6 +139,7 @@ pub fn section_json(display_path: &str, s: &SectionRef) -> serde_json::Value {
 impl<'a> From<&'a SearchResult> for ResultView<'a> {
     fn from(r: &'a SearchResult) -> Self {
         ResultView {
+            filepath: &r.filepath,
             docid: &r.docid,
             display_path: &r.display_path,
             title: &r.title,
@@ -140,6 +157,7 @@ impl<'a> From<&'a SearchResult> for ResultView<'a> {
 impl<'a> From<&'a HybridResult> for ResultView<'a> {
     fn from(r: &'a HybridResult) -> Self {
         ResultView {
+            filepath: &r.filepath,
             docid: &r.docid,
             display_path: &r.display_path,
             title: &r.title,
@@ -161,9 +179,10 @@ pub fn print_search_results(
     query: &str,
     format: OutputFormat,
     full: bool,
+    metadata: &Metadata,
 ) {
     let views: Vec<ResultView<'_>> = results.iter().map(ResultView::from).collect();
-    print_result_views(&views, query, format, full, None);
+    print_result_views(&views, query, format, full, None, metadata);
 }
 
 /// Print hybrid query results, using each result's best-chunk hint for
@@ -174,10 +193,15 @@ pub fn print_query_results(
     format: OutputFormat,
     full: bool,
     intent: Option<&str>,
+    metadata: &Metadata,
 ) {
     let views: Vec<ResultView<'_>> = results.iter().map(ResultView::from).collect();
-    print_result_views(&views, query, format, full, intent);
+    print_result_views(&views, query, format, full, intent, metadata);
 }
+
+/// Each result file's indexed `qmd.metadata`, by `qmd://` path; JSON output
+/// carries it when non-empty.
+pub type Metadata = HashMap<String, DocumentMetadata>;
 
 fn print_result_views(
     results: &[ResultView<'_>],
@@ -185,6 +209,7 @@ fn print_result_views(
     format: OutputFormat,
     full: bool,
     intent: Option<&str>,
+    metadata: &Metadata,
 ) {
     match format {
         OutputFormat::Json => {
@@ -208,6 +233,12 @@ fn print_result_views(
                     }
                     if let Some(ctx) = r.context {
                         obj.insert("context".into(), ctx.into());
+                    }
+                    if let Some(m) = metadata.get(r.filepath).filter(|m| !m.is_empty()) {
+                        obj.insert(
+                            "metadata".into(),
+                            serde_json::to_value(m).expect("metadata serializes"),
+                        );
                     }
                     if full {
                         obj.insert("body".into(), r.body.into());

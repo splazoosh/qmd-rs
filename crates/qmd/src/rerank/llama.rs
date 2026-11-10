@@ -10,7 +10,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 
-use crate::embed::llama_backend;
+use crate::embed::{llama_backend, take_log_errors, with_log_errors, without_nul};
 use crate::error::{Error, Result};
 use crate::rerank::Reranker;
 
@@ -42,8 +42,14 @@ impl LlamaReranker {
         let path = crate::models::ensure_model(model_uri)?;
         let backend = llama_backend()?;
         let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
-        let model = LlamaModel::load_from_file(backend, &path, &params)
-            .map_err(|e| Error::Other(format!("failed to load {}: {e}", path.display())))?;
+        take_log_errors();
+        let model = LlamaModel::load_from_file(backend, &path, &params).map_err(|e| {
+            Error::Other(format!(
+                "failed to load {}: {}",
+                path.display(),
+                with_log_errors(e)
+            ))
+        })?;
         let template = model
             .meta_val_str("tokenizer.chat_template.rerank")
             .ok()
@@ -58,7 +64,7 @@ impl LlamaReranker {
 
     fn tokens(&self, text: &str, bos: AddBos) -> Result<Vec<LlamaToken>> {
         self.model
-            .str_to_token(text, bos)
+            .str_to_token(&without_nul(text), bos)
             .map_err(|e| Error::Other(format!("tokenize failed: {e}")))
     }
 
@@ -104,10 +110,11 @@ impl Reranker for LlamaReranker {
             .with_n_ubatch(RERANK_CONTEXT_SIZE)
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Rank);
+        take_log_errors();
         let mut ctx = self
             .model
             .new_context(backend, ctx_params)
-            .map_err(|e| Error::Other(format!("rerank context: {e}")))?;
+            .map_err(|e| Error::Other(format!("rerank context: {}", with_log_errors(e))))?;
 
         let mut scores = Vec::with_capacity(documents.len());
         for document in documents {
@@ -118,7 +125,7 @@ impl Reranker for LlamaReranker {
                 .map_err(|e| Error::Other(format!("batch: {e}")))?;
             ctx.clear_kv_cache();
             ctx.decode(&mut batch)
-                .map_err(|e| Error::Other(format!("rerank decode: {e}")))?;
+                .map_err(|e| Error::Other(format!("rerank decode: {}", with_log_errors(e))))?;
             let out = ctx
                 .embeddings_seq_ith(0)
                 .map_err(|e| Error::Other(format!("rerank score: {e}")))?;

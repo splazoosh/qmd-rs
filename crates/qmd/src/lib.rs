@@ -12,6 +12,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod index;
+pub mod metadata;
 pub mod models;
 pub mod query;
 pub mod querylog;

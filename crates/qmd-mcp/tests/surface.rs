@@ -60,7 +60,7 @@ async fn call(
 }
 
 #[tokio::test]
-async fn initialize_lists_the_four_tools_and_the_resource_template() {
+async fn initialize_lists_the_five_tools_and_the_resource_template() {
     let fixture = Fixture::build();
     let (client, _) = connect(&fixture).await;
 
@@ -72,7 +72,7 @@ async fn initialize_lists_the_four_tools_and_the_resource_template() {
         .map(|t| t.name.to_string())
         .collect();
     names.sort();
-    assert_eq!(names, ["get", "multi_get", "query", "status"]);
+    assert_eq!(names, ["get", "metadata", "multi_get", "query", "status"]);
 
     let templates = client.list_all_resource_templates().await.unwrap();
     assert_eq!(templates.len(), 1);
@@ -353,6 +353,27 @@ async fn multi_get_takes_globs_lists_and_a_size_limit() {
 }
 
 #[tokio::test]
+async fn status_tells_a_failed_extraction_from_a_pending_one() {
+    let fixture = Fixture::build();
+    let (client, _) = connect(&fixture).await;
+    qmd::store::Store::open(&fixture.db_path)
+        .unwrap()
+        .conn()
+        .execute_batch("UPDATE document_metadata SET extraction_error = 'boom'")
+        .unwrap();
+
+    let status = call(&client, "status", json!({})).await;
+    let text = text_of(&status);
+    assert!(text.contains("Invalid frontmatter: "), "{text}");
+    assert!(!text.contains("Pending metadata"), "{text}");
+    let report = status.structured_content.unwrap();
+    assert_eq!(report["pendingMetadata"], 0);
+    assert!(report["invalidMetadata"].as_u64().unwrap() > 0, "{report}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn status_counts_the_index_without_naming_a_directory() {
     let fixture = Fixture::build();
     let (client, _) = connect(&fixture).await;
@@ -445,6 +466,149 @@ async fn section_documents_are_the_hits_and_get_reads_one() {
     let text = text_of(&section);
     assert!(text.contains("7: ## Garnish"), "{text}");
     assert!(!text.contains("Broth"), "{text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_applies_a_metadata_filter_and_returns_the_metadata() {
+    let fixture = Fixture::with_metadata();
+    let (client, _) = connect(&fixture).await;
+
+    let filter = json!({"operator": "and", "operands": [
+        {"field": "topics", "operator": "all", "value": ["raft"]},
+        {"field": "status", "operator": "ne", "value": "draft"},
+    ]});
+    for args in [
+        json!({ "query": "leader election quorum", "filter": filter }),
+        json!({ "searches": [{ "type": "lex", "query": "quorum" }], "filter": filter }),
+    ] {
+        let result = call(&client, "query", args).await;
+        assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+        let rows = result.structured_content.unwrap()["results"].clone();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["file"], "notes/meta/published.md");
+        assert_eq!(
+            rows[0]["metadata"],
+            json!({"status": "published", "priority": 5, "topics": ["raft", "consensus"]})
+        );
+    }
+
+    let result = call(
+        &client,
+        "query",
+        json!({ "searches": [{ "type": "lex", "query": "quorum" }] }),
+    )
+    .await;
+    let rows = result.structured_content.unwrap()["results"].clone();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+
+    let result = call(
+        &client,
+        "query",
+        json!({ "query": "raft", "filter": {"field": "status", "operator": "equal", "value": "x"} }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(text_of(&result).contains("Invalid metadata filter at $: unknown operator 'equal'"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_metadata_tool_reports_keys_values_and_windows() {
+    let fixture = Fixture::with_metadata();
+    let (client, _) = connect(&fixture).await;
+
+    let result = call(&client, "metadata", json!({})).await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let report = result.structured_content.clone().unwrap();
+    assert_eq!(report["documents"], 5, "{report}");
+    assert_eq!(report["totalKeys"], 3);
+    let keys: Vec<&str> = report["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["priority", "status", "topics"]);
+    assert_eq!(
+        report["keys"][0]["types"][0]["range"],
+        json!({"min": 1, "median": 3, "max": 5})
+    );
+    let text = text_of(&result);
+    assert!(text.starts_with("priority  number  2 of 5 documents  2 distinct\n  min 1  median 3  max 5\n  1 (1)  5 (1)"), "{text}");
+
+    let result = call(
+        &client,
+        "metadata",
+        json!({
+            "match": {"field": "key", "operator": "eq", "value": "topics"},
+            "filter": {"field": "status", "operator": "eq", "value": "published"},
+            "valueLimit": 1,
+        }),
+    )
+    .await;
+    let report = result.structured_content.clone().unwrap();
+    assert_eq!(report["filteredDocuments"], 1);
+    assert_eq!(report["keys"][0]["types"][0]["remainingValues"], 1);
+    let text = text_of(&result);
+    assert!(
+        text.starts_with(
+            "filter: 1 of 5 documents\n\ntopics  string[]  1 of 1 documents  2 distinct"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 more value, use a higher 'valueLimit' or a 'valueOffset'"),
+        "{text}"
+    );
+
+    let result = call(
+        &client,
+        "metadata",
+        json!({ "keyLimit": 1, "keyOffset": 1 }),
+    )
+    .await;
+    let report = result.structured_content.clone().unwrap();
+    assert_eq!(
+        (
+            report["keys"][0]["key"].clone(),
+            report["remainingKeys"].clone()
+        ),
+        (json!("status"), json!(1))
+    );
+    assert!(text_of(&result).contains("1 more key, use a higher 'keyLimit' or a 'keyOffset'"));
+
+    for (args, expected) in [
+        (
+            json!({ "match": {"field": "topics", "operator": "eq", "value": "x"} }),
+            "Invalid metadata match at $: 'topics' is not a field",
+        ),
+        (
+            json!({ "filter": {"operator": "nope"} }),
+            "Invalid metadata filter at $",
+        ),
+        (json!({ "keyLimit": 0 }), "Invalid keyLimit"),
+        (json!({ "collections": ["missing"] }), "missing"),
+    ] {
+        let result = call(&client, "metadata", args).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains(expected), "{}", text_of(&result));
+    }
+
+    let status = call(&client, "status", json!({})).await;
+    let text = text_of(&status);
+    assert!(
+        text.contains("metadata keys: priority (number), status (string), topics (string)"),
+        "{text}"
+    );
+    assert!(text.contains("call the 'metadata' tool"), "{text}");
+    let report = status.structured_content.unwrap();
+    assert_eq!(report["pendingMetadata"], 0);
+    assert_eq!(report["invalidMetadata"], 0);
+    assert_eq!(report["collections"][0]["metadataKeyCount"], 3);
 
     client.cancel().await.unwrap();
 }

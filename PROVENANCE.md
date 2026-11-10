@@ -6,8 +6,9 @@ shipped is in this repository; it is fetched by Cargo or by `qmd` itself.
 
 | Item | Origin | Licence |
 |---|---|---|
-| `crates/` | Written for this repository. The design, algorithms, SQLite schema and prompt formats are ported from qmd v2.6.3 (https://github.com/tobi/qmd). | MIT (`LICENSE`); the port carries the upstream notice in `LICENSE-UPSTREAM` |
+| `crates/` | Written for this repository. The design, algorithms, SQLite schema and prompt formats are ported from qmd v2.6.3 (https://github.com/tobi/qmd); document metadata from qmd at commit 86d2365, after v2.8.3. | MIT (`LICENSE`); the port carries the upstream notice in `LICENSE-UPSTREAM` |
 | `EXCLUDE_DIRS` | The directories qmd v2.6.3 never indexes | MIT (`LICENSE-UPSTREAM`) |
+| `ALL`, `FRONTMATTER_EXTENSIONS` | The filter operators, value types and frontmatter file extensions of qmd's document metadata (commit 86d2365) | MIT (`LICENSE-UPSTREAM`) |
 | `EVAL_QUERIES` | The queries and expected documents of qmd v2.6.3's evaluation tests | MIT (`LICENSE-UPSTREAM`) |
 | `SKIP`, `BLOCK`, `KEPT_HEADERS`, `MARKERS`, `DEVICES`, `OPEN_MARKERS`, `RESTRICTIVE_MARKERS`, `NEGATIONS`, `DOCUMENT_TYPES`, `A`, `B` | Written for this repository | MIT (`LICENSE`) |
 | `crates/qmd-archive/fixtures/` | Written for this repository: synthetic pages | MIT (`LICENSE`) |

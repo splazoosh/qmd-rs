@@ -12,14 +12,16 @@ pub use generate::{
     generate_embeddings,
 };
 #[cfg(feature = "llama")]
-pub(crate) use llama::backend as llama_backend;
-#[cfg(feature = "llama")]
 pub use llama::{LlamaEmbedder, gpu_offload};
+#[cfg(feature = "llama")]
+pub(crate) use llama::{backend as llama_backend, take_log_errors, with_log_errors, without_nul};
+
+use std::cell::Cell;
 
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{ChunkBoundary, ChunkParams, Tokenizer};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 const EMBED_FINGERPRINT_PROBE_QUERY: &str = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE: &str = "__qmd_embedding_title_probe__";
@@ -128,6 +130,8 @@ impl<T: Embedder + Tokenizer> EmbeddingBackend for T {}
 pub struct MockEmbedder {
     model_uri: String,
     dimensions: usize,
+    /// Batches left before every batch fails; `None` never fails.
+    batches_left: Option<Cell<usize>>,
 }
 
 impl Default for MockEmbedder {
@@ -141,6 +145,15 @@ impl MockEmbedder {
         Self {
             model_uri: model_uri.into(),
             dimensions,
+            batches_left: None,
+        }
+    }
+
+    /// The default mock, failing every batch after the first `batches`.
+    pub fn failing_after(batches: usize) -> Self {
+        Self {
+            batches_left: Some(Cell::new(batches)),
+            ..Self::default()
         }
     }
 
@@ -176,6 +189,12 @@ impl Embedder for MockEmbedder {
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Option<Vec<f32>>>> {
+        if let Some(left) = &self.batches_left {
+            if left.get() == 0 {
+                return Err(Error::Other("mock embedder fault".to_owned()));
+            }
+            left.set(left.get() - 1);
+        }
         Ok(texts.iter().map(|t| Some(self.vector_for(t))).collect())
     }
 }

@@ -8,14 +8,17 @@
 //! keeps one embedder however many clients are connected.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use qmd::config::{self, CollectionConfig};
 use qmd::embed::{Embedder, EmbeddingBackend};
 use qmd::rerank::Reranker;
 use qmd::store::Store;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::health::{EmbedderHealth, Watched};
 
 /// Loads the embedding backend for a model URI. The CLI supplies the real
 /// llama-backed one; tests supply a mock. Keeping it a callback keeps the
@@ -25,10 +28,16 @@ pub type EmbedderFactory = Box<dyn Fn(&str) -> Result<Box<dyn EmbeddingBackend>>
 /// Loads the reranker for a model URI, on first use.
 pub type RerankerFactory = Box<dyn Fn(&str) -> Result<Box<dyn Reranker>> + Send + 'static>;
 
+/// Hands the server over to a new process and does not return on success.
+/// Only a daemon has one: it alone has a port and a PID file to pass on.
+pub type Relaunch = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+
 /// The model loaders the index thread calls lazily.
 pub struct Factories {
     pub embedder: EmbedderFactory,
     pub reranker: RerankerFactory,
+    /// Called once, when an embedder that worked stops working.
+    pub relaunch: Option<Relaunch>,
 }
 
 /// The index, plus a lazily loaded embedder. Lives on the worker thread.
@@ -44,6 +53,7 @@ pub struct Index {
     embedder: Option<Box<dyn EmbeddingBackend>>,
     factories: Factories,
     reranker: Option<(String, Box<dyn Reranker>)>,
+    health: Arc<EmbedderHealth>,
 }
 
 impl Index {
@@ -56,6 +66,7 @@ impl Index {
         db_path: &Path,
         model: String,
         factories: Factories,
+        health: Arc<EmbedderHealth>,
     ) -> Result<Self> {
         let config = config::load_config(config_path)?;
         let store = Store::open(db_path)
@@ -71,6 +82,7 @@ impl Index {
             embedder: None,
             factories,
             reranker: None,
+            health,
         })
     }
 
@@ -104,7 +116,12 @@ impl Index {
     /// Propagates model-load failures.
     pub fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some((self.factories.embedder)(&self.model)?);
+            let inner = (self.factories.embedder)(&self.model)
+                .map_err(|e| anyhow!(self.health.failed(&format!("{e:#}"))))?;
+            self.embedder = Some(Box::new(Watched {
+                inner,
+                health: Arc::clone(&self.health),
+            }));
         }
         Ok(())
     }
@@ -128,6 +145,22 @@ impl Index {
     pub fn reranker(&self) -> Option<&dyn Reranker> {
         self.reranker.as_ref().map(|(_, r)| r.as_ref())
     }
+
+    /// The embedder's state, for `status`.
+    pub fn health(&self) -> &EmbedderHealth {
+        &self.health
+    }
+
+    /// Hand over to a new process if the embedder has stopped working. Runs
+    /// between jobs, so the failing request has its reply.
+    fn relaunch_if_due(&mut self) {
+        if self.health.relaunch_due()
+            && let Some(relaunch) = self.factories.relaunch.take()
+            && let Err(e) = relaunch()
+        {
+            self.health.relaunch_failed(&e);
+        }
+    }
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -140,6 +173,7 @@ type Job = Box<dyn FnOnce(&mut Index) + Send + 'static>;
 #[derive(Clone)]
 pub struct Worker {
     tx: mpsc::UnboundedSender<Job>,
+    health: Arc<EmbedderHealth>,
 }
 
 impl Worker {
@@ -161,19 +195,22 @@ impl Worker {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let config_path = config_path.to_owned();
         let db_path = db_path.to_owned();
+        let health = Arc::new(EmbedderHealth::new(factories.relaunch.is_some()));
+        let index_health = Arc::clone(&health);
         std::thread::Builder::new()
             .name("qmd-index".to_owned())
             .spawn(move || {
-                let mut index = match Index::open(&config_path, &db_path, model, factories) {
-                    Ok(index) => {
-                        let _ = ready_tx.send(Ok(()));
-                        index
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
+                let mut index =
+                    match Index::open(&config_path, &db_path, model, factories, index_health) {
+                        Ok(index) => {
+                            let _ = ready_tx.send(Ok(()));
+                            index
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
                 while let Some(job) = rx.blocking_recv() {
                     if let Err(e) = index.reload_config_if_changed() {
                         eprintln!("qmd: keeping the previous config: {e:#}");
@@ -182,13 +219,19 @@ impl Worker {
                     if std::panic::catch_unwind(run).is_err() {
                         eprintln!("qmd: a request panicked on the index thread");
                     }
+                    index.relaunch_if_due();
                 }
             })
             .context("failed to spawn the qmd index thread")?;
         ready_rx
             .recv()
             .context("the qmd index thread stopped before opening the index")??;
-        Ok(Self { tx })
+        Ok(Self { tx, health })
+    }
+
+    /// The embedder's state, readable while the index thread is busy.
+    pub fn health(&self) -> &EmbedderHealth {
+        &self.health
     }
 
     /// Run `f` on the index thread and await its result.

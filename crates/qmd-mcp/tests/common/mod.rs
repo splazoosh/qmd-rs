@@ -28,10 +28,33 @@ impl Fixture {
     /// The fixture with `recipes` set to section documents at `level`, and
     /// a two-section `recipes/soup.md`.
     pub fn build_with(recipe_sections: Option<u8>) -> Self {
+        Self::build_full(recipe_sections, false)
+    }
+
+    /// The fixture plus two `notes/meta/` documents declaring `qmd.metadata`:
+    /// `published.md` (status published, priority 5, topics [raft, consensus])
+    /// and `draft.md` (status draft, priority 1), both about leader election.
+    pub fn with_metadata() -> Self {
+        Self::build_full(None, true)
+    }
+
+    fn build_full(recipe_sections: Option<u8>, metadata: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
         let notes = root.join("notes");
+        if metadata {
+            write(
+                &notes.join("meta/published.md"),
+                "---\nqmd:\n  metadata:\n    status: published\n    priority: 5\n    \
+                 topics: [raft, consensus]\n---\n\n# Election Notes\n\nLeader election needs a quorum.\n",
+            );
+            write(
+                &notes.join("meta/draft.md"),
+                "---\nqmd:\n  metadata:\n    status: draft\n    priority: 1\n---\n\n\
+                 # Election Draft\n\nLeader election draft: quorum, quorum, quorum.\n",
+            );
+        }
         write(
             &notes.join("raft.md"),
             "# Raft Consensus\n\nRaft elects a leader; followers replicate the log.\n\
@@ -107,8 +130,17 @@ impl Fixture {
     }
 
     pub fn worker(&self) -> Worker {
-        let factory =
-            Box::new(|_: &str| Ok(Box::new(MockEmbedder::default()) as Box<dyn EmbeddingBackend>));
+        self.worker_with(
+            Box::new(|_: &str| Ok(Box::new(MockEmbedder::default()) as Box<dyn EmbeddingBackend>)),
+            None,
+        )
+    }
+
+    pub fn worker_with(
+        &self,
+        factory: qmd_mcp::EmbedderFactory,
+        relaunch: Option<qmd_mcp::Relaunch>,
+    ) -> Worker {
         Worker::spawn(
             &self.config_path,
             &self.db_path,
@@ -118,6 +150,7 @@ impl Fixture {
                 reranker: Box::new(|_: &str| {
                     Ok(Box::new(qmd::rerank::MockReranker) as Box<dyn qmd::rerank::Reranker>)
                 }),
+                relaunch,
             },
         )
         .unwrap()

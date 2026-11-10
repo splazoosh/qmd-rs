@@ -7,6 +7,7 @@ mod collections;
 mod docs;
 mod fts;
 mod maintenance;
+mod metadata;
 mod schema;
 mod sections;
 mod vectors;

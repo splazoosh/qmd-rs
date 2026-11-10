@@ -167,6 +167,12 @@ enum Command {
         /// Run the --http server in the background, recorded in a PID file
         #[arg(long, requires = "http")]
         daemon: bool,
+        /// This process is the server --daemon started
+        #[arg(long, hide = true, requires = "http")]
+        daemon_child: bool,
+        /// This process is taking over from a daemon that lost its embedder
+        #[arg(long, hide = true, requires = "http")]
+        replacement: bool,
     },
 }
 
@@ -269,6 +275,15 @@ enum CollectionCommand {
         /// Collection name
         name: String,
     },
+    /// Discover the qmd.metadata keys, types and value counts the index
+    /// holds, to write a --filter from. Without a name, the collections
+    /// queries search by default
+    Metadata {
+        /// Collection names
+        names: Vec<String>,
+        #[command(flatten)]
+        options: MetadataOptions,
+    },
     /// Set the shell command `qmd update` runs in the collection's directory
     /// before indexing it (e.g. 'git pull'); omit it to clear. Runs through
     /// `sh -c`, or `cmd /C` on Windows (TS qmd: `bash -c`). Under a
@@ -328,6 +343,61 @@ struct SearchOptions {
     /// overrides the config's search.match)
     #[arg(long = "match", value_name = "all|any")]
     term_match: Option<qmd::store::TermMatch>,
+    /// Return only documents whose qmd.metadata frontmatter this JSON filter
+    /// admits, e.g. '{"field":"status","operator":"eq","value":"published"}'
+    /// (see 'qmd collection metadata' for the keys and values indexed)
+    #[arg(long, value_name = "JSON")]
+    filter: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct MetadataOptions {
+    /// List every file whose frontmatter failed extraction, with the reason,
+    /// instead of the report. Without a name, every collection
+    #[arg(long, conflicts_with_all = [
+        "match", "filter", "key_limit", "key_offset", "all_keys", "value_limit",
+        "value_offset", "all_values", "sort", "min_count", "n", "all", "format",
+    ])]
+    errors: bool,
+    /// Report only the metadata entries this JSON condition matches: the
+    /// --filter grammar, where a condition's field is the entry's "key" or
+    /// "value"
+    #[arg(long = "match", value_name = "JSON")]
+    r#match: Option<String>,
+    /// Count only the documents this JSON metadata filter admits
+    #[arg(long, value_name = "JSON")]
+    filter: Option<String>,
+    /// Keys reported (default 50)
+    #[arg(long, value_name = "N")]
+    key_limit: Option<String>,
+    /// Keys skipped before the window, in report order
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    key_offset: Option<String>,
+    /// Report every key
+    #[arg(long)]
+    all_keys: bool,
+    /// Values reported per key and type (default 10)
+    #[arg(long, value_name = "N")]
+    value_limit: Option<String>,
+    /// Values skipped per key and type before the window
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    value_offset: Option<String>,
+    /// Report every value
+    #[arg(long)]
+    all_values: bool,
+    /// Value order: count (documents descending, the default) or value
+    #[arg(long, value_name = "count|value")]
+    sort: Option<String>,
+    /// Drop values held by fewer documents than this
+    #[arg(long, value_name = "N")]
+    min_count: Option<String>,
+    /// Search's window flags, refused with a pointer at the ones above
+    #[arg(short = 'n', hide = true)]
+    n: Option<String>,
+    #[arg(long, hide = true)]
+    all: bool,
+    #[arg(long, hide = true)]
+    format: Option<String>,
 }
 
 fn main() {
@@ -366,6 +436,9 @@ fn main() {
                 commands::collection_rename(&location, &old, &new)
             }
             CollectionCommand::Show { name } => commands::collection_show(&location, &name),
+            CollectionCommand::Metadata { names, options } => {
+                commands::collection_metadata(&location, &names, &options)
+            }
             CollectionCommand::UpdateCmd { name, command } => {
                 commands::collection_update_cmd(&location, &name, &command.join(" "))
             }
@@ -460,7 +533,20 @@ fn main() {
             port,
             ..
         } => daemon::start(&location, port),
-        Command::Mcp { http, port, .. } => commands::mcp(&location, http.then_some(port)),
+        Command::Mcp {
+            http,
+            port,
+            daemon_child,
+            replacement,
+            ..
+        } => {
+            let role = match (replacement, daemon_child) {
+                (true, _) => commands::McpRole::Replacement,
+                (false, true) => commands::McpRole::Daemon,
+                (false, false) => commands::McpRole::Foreground,
+            };
+            commands::mcp(&location, http.then_some(port), role)
+        }
     };
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
@@ -503,7 +589,9 @@ impl Command {
             | Command::Ls { .. } => true,
             Command::Collection { command } => matches!(
                 command,
-                CollectionCommand::List | CollectionCommand::Show { .. }
+                CollectionCommand::List
+                    | CollectionCommand::Show { .. }
+                    | CollectionCommand::Metadata { .. }
             ),
             Command::Context { command } => {
                 matches!(command, ContextCommand::List | ContextCommand::Check)

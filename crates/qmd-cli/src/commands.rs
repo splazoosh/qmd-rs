@@ -14,6 +14,7 @@ use qmd::querylog::{self, Arm, Via};
 
 /// Where the active index lives: the global config/cache directories, or a
 /// project-local `.qmd/` directory discovered by walking up from the cwd.
+#[derive(Clone)]
 pub enum IndexLocation {
     /// Global index by name (`{config_dir}/{name}.yml`, `{cache_dir}/{name}.sqlite`).
     Global(String),
@@ -36,7 +37,7 @@ impl IndexLocation {
         }
     }
 
-    fn config_path(&self) -> PathBuf {
+    pub(crate) fn config_path(&self) -> PathBuf {
         match self {
             Self::Global(name) => config::config_file_path(name),
             Self::Local(config_path) => config_path.clone(),
@@ -175,10 +176,16 @@ pub fn status(location: &IndexLocation) -> Result<()> {
         None => {}
     }
     if let Some(r) = crate::daemon::running(&crate::daemon::DaemonFiles::for_index(location)) {
-        println!(
-            "MCP:    {}running{} (PID {}, http://127.0.0.1:{}/mcp)",
-            c.green, c.reset, r.pid, r.port
-        );
+        match &r.embedder_error {
+            None => println!(
+                "MCP:    {}running{} (PID {}, http://127.0.0.1:{}/mcp)",
+                c.green, c.reset, r.pid, r.port
+            ),
+            Some(error) => println!(
+                "MCP:    {}degraded{} (PID {}, http://127.0.0.1:{}/mcp): {error}",
+                c.yellow, c.reset, r.pid, r.port
+            ),
+        }
     }
     println!();
 
@@ -188,6 +195,27 @@ pub fn status(location: &IndexLocation) -> Result<()> {
     if pending > 0 {
         println!(
             "  {}Pending:  {pending} need embedding{} (run 'qmd embed')",
+            c.yellow, c.reset
+        );
+    }
+    let metadata_keys = app.store.count_metadata_keys(None)?;
+    if metadata_keys > 0 {
+        println!(
+            "  Metadata: {metadata_keys} keys across {} files (explore with 'qmd collection metadata')",
+            app.store.count_documents_with_metadata(None)?
+        );
+    }
+    let pending_metadata = app.store.count_documents_pending_metadata(None)?;
+    if pending_metadata > 0 {
+        println!(
+            "  {}Metadata: {pending_metadata} need extraction{} (run 'qmd update'; excluded from --filter searches)",
+            c.yellow, c.reset
+        );
+    }
+    let invalid = app.store.count_metadata_failures(None)?;
+    if invalid > 0 {
+        println!(
+            "  {}Metadata: {invalid} with invalid frontmatter{} (list with {ERRORS_COMMAND}; excluded from --filter searches)",
             c.yellow, c.reset
         );
     }
@@ -328,6 +356,7 @@ pub fn collection_add(
         "Indexed: {} new, {} updated, {} unchanged, {} removed",
         result.indexed, result.updated, result.unchanged, result.removed
     );
+    report_metadata_failures(&app, Some(std::slice::from_ref(&coll_name)))?;
     println!("✓ Collection '{coll_name}' created successfully");
     Ok(())
 }
@@ -346,6 +375,9 @@ pub fn collection_list(location: &IndexLocation) -> Result<()> {
         collections.len(),
         c.reset
     );
+    let overviews = app
+        .store
+        .metadata_overviews(Some(COLLECTION_METADATA_KEYS))?;
     for coll in collections {
         let exclude_tag = if coll.include_by_default {
             ""
@@ -364,6 +396,16 @@ pub fn collection_list(location: &IndexLocation) -> Result<()> {
         }
         println!("  {}Path:{}     {}", c.dim, c.reset, coll.path);
         println!("  {}Files:{}    {}", c.dim, c.reset, coll.active_count);
+        if let Some(overview) = overviews.get(&coll.name) {
+            let shown: Vec<&str> = overview.keys.iter().map(|k| k.key.as_str()).collect();
+            let hidden = overview.total_keys.saturating_sub(shown.len() as u64);
+            let more = if hidden > 0 {
+                format!(", +{hidden} more")
+            } else {
+                String::new()
+            };
+            println!("  {}Metadata:{} {}{more}", c.dim, c.reset, shown.join(", "));
+        }
         if let Some(modified) = &coll.last_modified {
             println!("  {}Updated:{}  {}", c.dim, c.reset, modified);
         }
@@ -478,8 +520,154 @@ pub fn collection_show(location: &IndexLocation, name: &str) -> Result<()> {
             println!("  Updated:  {modified}");
         }
     }
+
+    let scope = [name.to_owned()];
+    let result = app
+        .store
+        .list_metadata(&qmd::metadata::ListMetadataOptions {
+            collections: Some(scope.to_vec()),
+            key_limit: Some(qmd::metadata::report::Limit::At(COLLECTION_METADATA_KEYS)),
+            value_limit: Some(qmd::metadata::report::Limit::At(3)),
+            ..Default::default()
+        })?;
+    let drill_down = format!("qmd collection metadata {name}");
+    println!(
+        "{}",
+        qmd::metadata::format::format_overview(
+            &result,
+            &qmd::metadata::format::OverviewOptions {
+                documents_with_metadata: app.store.count_documents_with_metadata(Some(&scope))?,
+                pending_metadata: app.store.count_documents_pending_metadata(Some(&scope))?,
+                failed_metadata: app.store.count_metadata_failures(Some(&scope))?,
+                drill_down_hint: &drill_down,
+                colors: colors().metadata(),
+            }
+        )
+    );
     Ok(())
 }
+
+/// Keys named on `collection list`, and detailed on `collection show`.
+const COLLECTION_METADATA_KEYS: u64 = 5;
+
+/// `qmd collection metadata`: the keys, types and value counts in the
+/// collections named, or in the default ones.
+pub fn collection_metadata(
+    location: &IndexLocation,
+    names: &[String],
+    o: &crate::MetadataOptions,
+) -> Result<()> {
+    use qmd::metadata::format::{FormatOptions, format_key_summaries};
+    use qmd::metadata::report::{Limit, ValueSort};
+    use qmd::metadata::{ListMetadataOptions, MetadataMatch};
+
+    if o.errors {
+        return list_metadata_failures(location, names);
+    }
+    if o.n.is_some() {
+        bail!(
+            "-n is not an option of 'qmd collection metadata'\n\
+             Use --value-limit <n> for values per key, or --key-limit <n> for keys"
+        );
+    }
+    if o.all {
+        bail!(
+            "--all is not an option of 'qmd collection metadata'\nUse --all-values, --all-keys, or both"
+        );
+    }
+    if let Some(f) = o
+        .format
+        .as_deref()
+        .filter(|f| !f.trim().eq_ignore_ascii_case("cli"))
+    {
+        bail!(
+            "--format {f} is not supported by 'qmd collection metadata'\n\
+             This command prints text. Use the MCP metadata tool or POST /metadata for structured output"
+        );
+    }
+    let positive = |raw: &Option<String>, flag: &str| -> Result<Option<u64>> {
+        raw.as_deref()
+            .map(|r| match r.parse::<u64>() {
+                Ok(n) if (1..=MAX_SAFE_INTEGER).contains(&n) => Ok(n),
+                _ => Err(anyhow!(
+                    "Invalid {flag} value: {r}\n{flag} must be a positive safe integer"
+                )),
+            })
+            .transpose()
+    };
+    let non_negative = |raw: &Option<String>, flag: &str| -> Result<Option<u64>> {
+        raw.as_deref()
+            .map(|r| match r.parse::<u64>() {
+                Ok(n) if n <= MAX_SAFE_INTEGER => Ok(n),
+                _ => Err(anyhow!(
+                    "Invalid {flag} value: {r}\n{flag} must be a non-negative safe integer"
+                )),
+            })
+            .transpose()
+    };
+    let window = |all: bool, limit: Option<u64>| {
+        if all {
+            Some(Limit::Unbounded)
+        } else {
+            limit.map(Limit::At)
+        }
+    };
+    let sort = match o.sort.as_deref() {
+        None => ValueSort::Count,
+        Some(s) => ValueSort::parse(s)
+            .ok_or_else(|| anyhow!("Invalid --sort value: {s}\nValid: count, value"))?,
+    };
+    let mut options = ListMetadataOptions {
+        r#match: parse_predicate(
+            o.r#match.as_deref(),
+            "--match",
+            r#"{"field":"key","operator":"eq","value":"topics"}"#,
+            MetadataMatch::parse,
+        )?,
+        filter: parse_filter(o.filter.as_deref())?,
+        key_limit: window(o.all_keys, positive(&o.key_limit, "--key-limit")?),
+        key_offset: non_negative(&o.key_offset, "--key-offset")?,
+        value_limit: window(o.all_values, positive(&o.value_limit, "--value-limit")?),
+        value_offset: non_negative(&o.value_offset, "--value-offset")?,
+        sort,
+        min_count: positive(&o.min_count, "--min-count")?,
+        ..Default::default()
+    };
+
+    let app = open(location)?;
+    if app.store.list_collections_with_stats()?.is_empty() {
+        println!("No collections found. Run 'qmd collection add .' to create one.");
+        return Ok(());
+    }
+    let names = resolve_collection_filter(&app, names)?;
+    warn_pending_metadata(&app, &names)?;
+    options.collections = (!names.is_empty()).then(|| names.clone());
+    let result = app.store.list_metadata(&options)?;
+
+    let empty_message = if options.r#match.is_some() || options.filter.is_some() {
+        "No metadata matches. Run 'qmd collection metadata' without --match or --filter to see which keys exist."
+    } else {
+        "No metadata found. Add qmd.metadata frontmatter and run 'qmd update'."
+    };
+    println!(
+        "{}",
+        format_key_summaries(
+            &result,
+            &FormatOptions {
+                show_collections: names.len() != 1,
+                value_window_hint: "--value-limit <n>, --value-offset <n>, or --all-values",
+                key_window_hint: "--key-limit <n>, --key-offset <n>, or --all-keys",
+                key_offset: options.key_offset.unwrap_or(0),
+                key_offset_label: "--key-offset",
+                empty_message,
+                colors: colors().metadata(),
+            }
+        )
+    );
+    Ok(())
+}
+
+const MAX_SAFE_INTEGER: u64 = qmd::metadata::report::MAX_SAFE_INTEGER;
 
 pub fn collection_sections(location: &IndexLocation, name: &str, level: Option<u8>) -> Result<()> {
     let mut app = open(location)?;
@@ -897,6 +1085,7 @@ pub fn update(location: &IndexLocation) -> Result<()> {
         }
         println!();
     }
+    report_metadata_failures(&app, None)?;
     if skipped.is_empty() {
         println!("✓ All collections updated.");
     } else {
@@ -907,6 +1096,56 @@ pub fn update(location: &IndexLocation) -> Result<()> {
             skipped.join(", "),
             c.reset
         );
+    }
+    Ok(())
+}
+
+/// Failing files an indexing command names; the rest are counted, and
+/// [`ERRORS_COMMAND`] lists them all.
+const METADATA_FAILURES_SHOWN: usize = 10;
+
+const ERRORS_COMMAND: &str = "'qmd collection metadata --errors'";
+
+/// Warn about every file in scope still failing, not only those this pass
+/// extracted: an unchanged file is not retried, and stays excluded.
+fn report_metadata_failures(app: &App, collections: Option<&[String]>) -> Result<()> {
+    let failures = app.store.metadata_failures(collections)?;
+    if failures.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "⚠ {} file(s) have invalid frontmatter and are excluded from filtered search:",
+        failures.len()
+    );
+    for failure in failures.iter().take(METADATA_FAILURES_SHOWN) {
+        eprintln!("  {failure}");
+    }
+    if failures.len() > METADATA_FAILURES_SHOWN {
+        eprintln!(
+            "  ... and {} more: {ERRORS_COMMAND}",
+            failures.len() - METADATA_FAILURES_SHOWN
+        );
+    }
+    Ok(())
+}
+
+/// `qmd collection metadata --errors`: the whole list, past the bound
+/// [`report_metadata_failures`] keeps. Without names it covers every
+/// collection, as `qmd update` warns about every collection, not only the
+/// ones queries search by default.
+fn list_metadata_failures(location: &IndexLocation, names: &[String]) -> Result<()> {
+    let app = open(location)?;
+    let scope = if names.is_empty() {
+        None
+    } else {
+        Some(resolve_collection_filter(&app, names)?)
+    };
+    let failures = app.store.metadata_failures(scope.as_deref())?;
+    if failures.is_empty() {
+        println!("No files have invalid frontmatter.");
+    }
+    for failure in &failures {
+        println!("{failure}");
     }
     Ok(())
 }
@@ -1006,6 +1245,69 @@ fn resolve_collection_filter(app: &App, requested: &[String]) -> Result<Vec<Stri
     Ok(app.config.query_collections(requested)?)
 }
 
+/// Parse a JSON predicate flag with its record's parser, failing with the
+/// flag, the parser's message and an example.
+fn parse_predicate<T>(
+    raw: Option<&str>,
+    flag: &str,
+    example: &str,
+    parse: impl Fn(&serde_json::Value) -> std::result::Result<T, qmd::metadata::FilterError>,
+) -> Result<Option<T>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let json: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow!("Invalid {flag} JSON: {e}\nExample: {flag} '{example}'"))?;
+    Ok(Some(parse(&json).map_err(|e| anyhow!("{e}"))?))
+}
+
+/// `--filter`, validated.
+fn parse_filter(raw: Option<&str>) -> Result<Option<qmd::metadata::MetadataFilter>> {
+    parse_predicate(
+        raw,
+        "--filter",
+        r#"{"field":"status","operator":"eq","value":"published"}"#,
+        qmd::metadata::MetadataFilter::parse,
+    )
+}
+
+/// Filtered search and discovery leave out documents without a current
+/// extraction; say so when that makes the result incomplete, within the
+/// collections the command reads.
+fn warn_pending_metadata(app: &App, collections: &[String]) -> Result<()> {
+    let scope = (!collections.is_empty()).then_some(collections);
+    let pending = app.store.count_documents_pending_metadata(scope)?;
+    let c = colors();
+    if pending > 0 {
+        eprintln!(
+            "{}Warning: {pending} document(s) lack current metadata extraction and are excluded \
+             from filtered results. Run 'qmd update'.{}",
+            c.yellow, c.reset
+        );
+    }
+    let invalid = app.store.count_metadata_failures(scope)?;
+    if invalid > 0 {
+        eprintln!(
+            "{}Warning: {invalid} document(s) have invalid frontmatter and are excluded from \
+             filtered results. List them with {ERRORS_COMMAND}.{}",
+            c.yellow, c.reset
+        );
+    }
+    Ok(())
+}
+
+/// The indexed metadata of results, for JSON output.
+fn result_metadata<T>(
+    app: &App,
+    format: format::OutputFormat,
+    results: &[T],
+    filepath: impl Fn(&T) -> &str,
+) -> Result<format::Metadata> {
+    if format != format::OutputFormat::Json {
+        return Ok(format::Metadata::new());
+    }
+    let paths: Vec<String> = results.iter().map(|r| filepath(r).to_owned()).collect();
+    Ok(app.store.metadata_by_filepath(&paths)?)
+}
+
 /// Drop results outside the selected collections (multi-collection filters
 /// run post-hoc; single-collection filters run at the SQL level).
 fn retain_collections<T>(results: &mut Vec<T>, names: &[String], filepath: impl Fn(&T) -> &str) {
@@ -1028,9 +1330,17 @@ pub fn search(location: &IndexLocation, query: &str, opts: &SearchOptions) -> Re
         .term_match
         .or(app.config.search_settings().term_match)
         .unwrap_or_default();
-    let mut results =
-        app.store
-            .search_fts_with(query, fetch_limit, single_collection.as_deref(), term_match)?;
+    let filter = parse_filter(opts.filter.as_deref())?;
+    if filter.is_some() {
+        warn_pending_metadata(&app, &collection_names)?;
+    }
+    let mut results = app.store.search_fts_filtered(
+        query,
+        fetch_limit,
+        single_collection.as_deref(),
+        term_match,
+        filter.as_ref(),
+    )?;
     retain_collections(&mut results, &collection_names, |r| &r.filepath);
 
     let min_score = opts.min_score.unwrap_or(0.0);
@@ -1042,7 +1352,8 @@ pub fn search(location: &IndexLocation, query: &str, opts: &SearchOptions) -> Re
         format::print_empty_results(opts.format);
         return Ok(());
     }
-    format::print_search_results(&results, query, opts.format, opts.full);
+    let metadata = result_metadata(&app, opts.format, &results, |r| &r.filepath)?;
+    format::print_search_results(&results, query, opts.format, opts.full, &metadata);
     Ok(())
 }
 
@@ -1063,6 +1374,18 @@ fn embed_model(config: &CollectionConfig) -> String {
     qmd::models::resolve_embed_model(config.models.as_ref())
 }
 
+/// The mock `QMD_MOCK_EMBEDDER` selects; `fail-after-N` makes it fail once it
+/// has embedded N batches.
+fn mock_embedder() -> qmd::embed::MockEmbedder {
+    std::env::var("QMD_MOCK_EMBEDDER")
+        .ok()
+        .and_then(|v| v.strip_prefix("fail-after-")?.parse().ok())
+        .map_or_else(
+            qmd::embed::MockEmbedder::default,
+            qmd::embed::MockEmbedder::failing_after,
+        )
+}
+
 /// Whether `QMD_MOCK_EMBEDDER` selects the deterministic mock backend
 /// (test seam, mirroring the TS CI mode that disables LLM operations).
 fn mock_embedder_requested() -> bool {
@@ -1075,7 +1398,7 @@ fn mock_embedder_requested() -> bool {
 #[cfg(feature = "llama")]
 fn load_embedder(model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
     if mock_embedder_requested() {
-        return Ok(Box::new(qmd::embed::MockEmbedder::default()));
+        return Ok(Box::new(mock_embedder()));
     }
     let embedder = qmd::embed::LlamaEmbedder::load(model).with_context(|| {
         format!(
@@ -1132,7 +1455,7 @@ const CPU_EMBED_WARNING: &str = "this qmd has no GPU offload and embeds on the C
 #[cfg(not(feature = "llama"))]
 fn load_embedder(_model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
     if mock_embedder_requested() {
-        return Ok(Box::new(qmd::embed::MockEmbedder::default()));
+        return Ok(Box::new(mock_embedder()));
     }
     bail!(
         "this build has no embedding backend: rebuild qmd-cli with its default \
@@ -1146,6 +1469,7 @@ pub fn vsearch(location: &IndexLocation, query: &str, opts: &SearchOptions) -> R
     let app = open(location)?;
     let collection_names = resolve_collection_filter(&app, &opts.collections)?;
     let single_collection = (collection_names.len() == 1).then(|| collection_names[0].clone());
+    let filter = parse_filter(opts.filter.as_deref())?;
 
     let embedded: i64 = if app.store.vec_table_exists()? {
         app.store
@@ -1169,9 +1493,15 @@ pub fn vsearch(location: &IndexLocation, query: &str, opts: &SearchOptions) -> R
     let limit = if opts.all { 100_000 } else { limit };
     let fetch_limit = if opts.all { 100_000 } else { limit.max(20) };
 
-    let mut results =
-        app.store
-            .search_vec(&embedding, fetch_limit, single_collection.as_deref())?;
+    if filter.is_some() {
+        warn_pending_metadata(&app, &collection_names)?;
+    }
+    let mut results = app.store.search_vec_filtered(
+        &embedding,
+        fetch_limit,
+        single_collection.as_deref(),
+        filter.as_ref(),
+    )?;
     retain_collections(&mut results, &collection_names, |r| &r.filepath);
 
     let min_score = opts.min_score.unwrap_or(0.3);
@@ -1183,7 +1513,8 @@ pub fn vsearch(location: &IndexLocation, query: &str, opts: &SearchOptions) -> R
         format::print_empty_results(opts.format);
         return Ok(());
     }
-    format::print_search_results(&results, query, opts.format, opts.full);
+    let metadata = result_metadata(&app, opts.format, &results, |r| &r.filepath)?;
+    format::print_search_results(&results, query, opts.format, opts.full, &metadata);
     Ok(())
 }
 
@@ -1201,6 +1532,10 @@ pub fn query(
 
     let app = open(location)?;
     let collection_names = resolve_collection_filter(&app, &opts.collections)?;
+    let filter = parse_filter(opts.filter.as_deref())?;
+    if filter.is_some() {
+        warn_pending_metadata(&app, &collection_names)?;
+    }
 
     let parsed = parse_structured_query(query).map_err(|e| anyhow!("{e}"))?;
     let intent = intent
@@ -1241,6 +1576,7 @@ pub fn query(
         intent: intent.clone(),
         term_match: opts.term_match.or(settings.term_match).unwrap_or_default(),
         explain,
+        filter,
         ..Default::default()
     };
 
@@ -1335,12 +1671,14 @@ pub fn query(
         format::print_empty_results(opts.format);
         return Ok(());
     }
+    let metadata = result_metadata(&app, opts.format, &results, |r| &r.filepath)?;
     format::print_query_results(
         &results,
         &display_query,
         opts.format,
         opts.full,
         intent.as_deref(),
+        &metadata,
     );
     Ok(())
 }
@@ -1558,11 +1896,21 @@ fn parse_line_suffix(input: &str) -> Option<(String, usize, Option<usize>)> {
 }
 
 /// The model loaders the MCP index thread calls on first use.
-fn factories() -> qmd_mcp::Factories {
+fn factories(relaunch: Option<qmd_mcp::Relaunch>) -> qmd_mcp::Factories {
     qmd_mcp::Factories {
         embedder: Box::new(load_embedder),
         reranker: Box::new(load_reranker),
+        relaunch,
     }
+}
+
+/// How `qmd mcp` was started: by hand, or as the daemon.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpRole {
+    Foreground,
+    Daemon,
+    /// The daemon, taking over from a process that lost its embedder.
+    Replacement,
 }
 
 /// `qmd mcp`: serve the active index over MCP on stdin/stdout, or with
@@ -1570,7 +1918,9 @@ fn factories() -> qmd_mcp::Factories {
 ///
 /// The CLI supplies the embedder factory so the `llama` feature and its native
 /// build stay on this side of the seam; `qmd-mcp` never links llama.cpp.
-pub fn mcp(location: &IndexLocation, http_port: Option<u16>) -> Result<()> {
+pub fn mcp(location: &IndexLocation, http_port: Option<u16>, role: McpRole) -> Result<()> {
+    let handover =
+        (role == McpRole::Replacement).then(|| crate::daemon::StartLock::handed_over(location));
     let config_path = location.config_path();
     let db_path = location.db_path()?;
     let config = config::load_config(&config_path)?;
@@ -1585,16 +1935,31 @@ pub fn mcp(location: &IndexLocation, http_port: Option<u16>) -> Result<()> {
             &config_path,
             &db_path,
             model,
-            factories(),
+            factories(None),
         ));
     };
+    if role == McpRole::Replacement {
+        crate::daemon::await_port(port)?;
+    }
+    let relaunch: Option<qmd_mcp::Relaunch> = (role != McpRole::Foreground).then(|| {
+        let location = location.clone();
+        Box::new(move || crate::daemon::relaunch(&location, port)) as qmd_mcp::Relaunch
+    });
     let served = runtime.block_on(qmd_mcp::serve_http(
         &config_path,
         &db_path,
         model,
-        factories(),
+        factories(relaunch),
         std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-        |addr| eprintln!("QMD MCP server listening on http://{addr}/mcp"),
+        move |addr| {
+            eprintln!("QMD MCP server listening on http://{addr}/mcp");
+            if role == McpRole::Replacement
+                && let Err(e) = crate::daemon::record(location, port)
+            {
+                eprintln!("qmd: {e:#}");
+            }
+            drop(handover);
+        },
         async {
             let _ = tokio::signal::ctrl_c().await;
         },

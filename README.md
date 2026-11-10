@@ -80,14 +80,58 @@ shows which.
 ## MCP
 
 `qmd mcp` serves the index to an agent over MCP on stdio, with the tools
-`query`, `get`, `multi_get` and `status`:
+`query` (which takes the metadata `filter`), `get`, `multi_get`, `status` and
+`metadata` (the report `qmd collection metadata` prints):
 
 ```json
 { "mcpServers": { "qmd": { "command": "qmd", "args": ["mcp"] } } }
 ```
 
 `qmd mcp --http --daemon` serves the same tools from one shared process on
-`http://127.0.0.1:8181/mcp`; `qmd mcp stop` ends it.
+`http://127.0.0.1:8181/mcp`, with `POST /query` and `POST /metadata` taking the
+tools' arguments as JSON; `qmd mcp stop` ends it.
+
+## Metadata
+
+A markdown document can declare typed metadata in its frontmatter, under
+`qmd.metadata`: strings, numbers, booleans, or flat arrays of one of those.
+
+```yaml
+---
+qmd:
+  metadata:
+    status: published
+    priority: 3
+    topics: [typescript, search]
+---
+```
+
+`qmd update` extracts it, and backfills an index built before it existed;
+nothing is re-embedded, and the frontmatter stays ordinary searchable text.
+`search`, `vsearch` and `query` take `--filter <json>`, one recursive filter
+whose every result satisfies it: `and`/`or`/`not`, `eq` `ne` `gt` `gte` `lt`
+`lte`, `in` `nin` `all`, `contains` `prefix` `suffix`, `type` and `exists`,
+with `caseInsensitive` on a string condition:
+
+```
+qmd query "release checklist" --filter '{"operator":"and","operands":[
+  {"field":"topics","operator":"all","value":["search"]},
+  {"field":"status","operator":"ne","value":"draft"}]}'
+```
+
+`qmd collection metadata [name...]` reports the keys, their types and how many
+documents hold each value; `--match <json>` picks which entries it reports
+(the same grammar, over each entry's `key` and `value`), `--filter` which
+documents it counts, and `--key-limit`, `--key-offset`, `--all-keys`,
+`--value-limit`, `--value-offset`, `--all-values`, `--sort count|value` and
+`--min-count` shape the report. `collection list`, `collection show` and
+`status` summarize it. A file whose frontmatter does not parse, or whose
+`qmd.metadata` is invalid, still indexes but no filter admits it: `qmd update`
+names the first ten such files with the reason on every run, and
+`qmd collection metadata --errors [name...]` lists them all. In a `sectionLevel` collection a file's metadata
+belongs to each of its sections, so a filter keeps or drops a file's sections
+together. Documents and filters are written as for qmd at commit 86d2365,
+which follows its v2.8.3 release.
 
 ## Licence
 

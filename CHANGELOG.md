@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.6.0
+
+- Document metadata, as in qmd after its v2.8.3 release (commit 86d2365). A
+  markdown document can declare typed values in its frontmatter under
+  `qmd.metadata` (strings, numbers, booleans, or flat arrays of one type).
+  `qmd update` extracts them, and backfills an existing index without
+  re-embedding; the frontmatter stays ordinary searchable text, and a
+  document without the block behaves as before. `search`, `vsearch` and
+  `query` take `--filter <json>`, and MCP `query` and `POST /query` take
+  `filter`: one recursive filter (`and`/`or`/`not`, `eq` `ne` `gt` `gte` `lt`
+  `lte`, `in` `nin` `all`, `contains` `prefix` `suffix`, `type`, `exists`,
+  `caseInsensitive`) applied before fusion and rerank, so every result
+  satisfies it. JSON and MCP results carry each document's `metadata`. In a
+  `sectionLevel` collection the filter keeps or drops a file's sections
+  together.
+- Metadata discovery: `qmd collection metadata [name...]` reports keys, types
+  and per-value document counts, with `--match` (which entries), `--filter`
+  (which documents), `--key-limit`/`--key-offset`/`--all-keys`,
+  `--value-limit`/`--value-offset`/`--all-values`, `--sort count|value` and
+  `--min-count`. The MCP server adds a `metadata` tool and the HTTP server
+  `POST /metadata`; `collection list`, `collection show`, `status` and MCP
+  `status` summarize the keys, and `status` counts documents awaiting
+  extraction.
+- `qmd update` names each file with invalid frontmatter, with its collection
+  and reason, on every run until it is fixed, at most ten;
+  `qmd collection metadata --errors [name...]` lists them all. `status`,
+  `collection show`, the filter warning and MCP `status` (`invalidMetadata`)
+  count these apart from documents awaiting extraction, since `qmd update`
+  does not retry them. A YAML error's line number is now the file's.
+- A daemon that loses its embedder says so and recovers. `GET /health` reports
+  `degraded` with `embedder` and `embedderError`, MCP `status` and `qmd status`
+  carry the failure, and a daemon that had been embedding hands over to a new
+  process on the same port. Embedding and rerank errors now include what
+  llama.cpp logged, such as the CUDA failure, instead of only `null reference`.
+- A NUL byte in a document, query or rerank text becomes a space before it is
+  tokenized. Before, it failed the whole embedding or rerank batch.
+
 ## 0.5.0
 
 - Section documents: `sectionLevel: N` (1–6), `collection add --section-level N`

@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, params};
 
 use crate::chunk::ChunkParams;
 use crate::embed::embedding_fingerprint_for;
 use crate::error::{Error, Result};
+use crate::metadata::MetadataFilter;
 use crate::store::{SearchResult, Store};
 
 /// A document (by content hash) that still needs embeddings.
@@ -347,20 +349,48 @@ impl Store {
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        self.search_vec_filtered(query_embedding, limit, collection, None)
+    }
+
+    /// [`Store::search_vec`] restricted to documents a metadata `filter`
+    /// admits. When the admitted documents hold at most [`MAX_KNN_K`]
+    /// chunks, each is measured directly and the result is exact; past that
+    /// the KNN widens as for a collection, which is best-effort for a filter
+    /// that admits few of the nearest chunks.
+    pub fn search_vec_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        collection: Option<&str>,
+        filter: Option<&MetadataFilter>,
+    ) -> Result<Vec<SearchResult>> {
         if !self.vec_table_exists()? {
             return Ok(Vec::new());
         }
-
-        let mut k = limit
-            .saturating_mul(if collection.is_some() { 10 } else { 3 })
-            .clamp(1, MAX_KNN_K);
+        let scope = VecScope { collection, filter };
         let levels = self.section_levels()?;
-        let best = loop {
-            let (fetched, best) = self.vec_candidates(query_embedding, k, collection, &levels)?;
-            if best.len() >= limit || fetched < k || k == MAX_KNN_K {
-                break best;
+
+        let exact = match filter {
+            Some(_) => self.eligible_chunks(&scope)?,
+            None => None,
+        };
+        let best = if let Some(chunks) = exact {
+            let neighbours = self.measure_chunks(query_embedding, &chunks)?;
+            self.resolve_neighbours(&neighbours, &scope, &levels)?
+        } else {
+            let narrowed = collection.is_some() || filter.is_some();
+            let mut k = limit
+                .saturating_mul(if narrowed { 10 } else { 3 })
+                .clamp(1, MAX_KNN_K);
+            loop {
+                let neighbours = self.knn(query_embedding, k)?;
+                let fetched = neighbours.len();
+                let best = self.resolve_neighbours(&neighbours, &scope, &levels)?;
+                if best.len() >= limit || fetched < k || k == MAX_KNN_K {
+                    break best;
+                }
+                k = k.saturating_mul(4).min(MAX_KNN_K);
             }
-            k = k.saturating_mul(4).min(MAX_KNN_K);
         };
 
         let mut hits: Vec<(VecRow, f64)> = best.into_values().collect();
@@ -435,39 +465,77 @@ impl Store {
         Ok(distances)
     }
 
-    /// The two steps of [`Self::search_vec`] for one `k`: returns how many
-    /// neighbours vec0 gave, and the surviving rows deduped by file, or by
-    /// section in a collection of `levels` (closest chunk wins).
-    fn vec_candidates(
+    /// Step 1 of [`Self::search_vec`]: the `k` nearest chunks by vec0 alone,
+    /// as `(hash_seq, distance)`.
+    fn knn(&self, query_embedding: &[f32], k: usize) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ?1 AND k = ?2",
+        )?;
+        #[allow(clippy::cast_possible_wrap)]
+        let rows = stmt.query_map(params![embedding_blob(query_embedding), k as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The `hash_seq` of every chunk a filtered scope admits, when there are
+    /// at most [`MAX_KNN_K`] of them; `None` when there are more.
+    fn eligible_chunks(&self, scope: &VecScope<'_>) -> Result<Option<Vec<String>>> {
+        let (where_sql, params) = scope.where_sql();
+        let sql = format!(
+            "SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+             WHERE EXISTS (SELECT 1 FROM documents d
+                           WHERE d.hash = cv.hash AND d.active = 1{where_sql})
+             LIMIT {}",
+            MAX_KNN_K + 1
+        );
+        let mut stmt = self.conn().prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| r.get(0))?;
+        let chunks: Vec<String> = rows.collect::<std::result::Result<_, _>>()?;
+        Ok((chunks.len() <= MAX_KNN_K).then_some(chunks))
+    }
+
+    /// Each chunk's cosine distance to the query, by one vec0 point lookup
+    /// per chunk, never a JOIN (see [`Self::search_vec`]).
+    fn measure_chunks(
         &self,
         query_embedding: &[f32],
-        k: usize,
-        collection: Option<&str>,
+        chunks: &[String],
+    ) -> Result<Vec<(String, f64)>> {
+        let blob = embedding_blob(query_embedding);
+        let mut stmt = self.conn().prepare(
+            "SELECT vec_distance_cosine(embedding, ?1) FROM vectors_vec WHERE hash_seq = ?2",
+        )?;
+        let mut measured = Vec::with_capacity(chunks.len());
+        for hash_seq in chunks {
+            let distance: Option<f64> = stmt
+                .query_row(params![blob, hash_seq], |r| r.get(0))
+                .optional()?;
+            if let Some(distance) = distance {
+                measured.push((hash_seq.clone(), distance));
+            }
+        }
+        Ok(measured)
+    }
+
+    /// Step 2 of [`Self::search_vec`]: the scope's document rows for the
+    /// neighbours, deduped by file, or by section in a collection of
+    /// `levels` (closest chunk wins).
+    fn resolve_neighbours(
+        &self,
+        knn: &[(String, f64)],
+        scope: &VecScope<'_>,
         levels: &HashMap<String, u8>,
-    ) -> Result<(usize, BestByFile)> {
-        let knn: Vec<(String, f64)> = {
-            let mut stmt = self.conn().prepare(
-                "SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ?1 AND k = ?2",
-            )?;
-            #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![embedding_blob(query_embedding), k as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
+    ) -> Result<BestByFile> {
         let mut best: BestByFile = HashMap::new();
         if knn.is_empty() {
-            return Ok((0, best));
+            return Ok(best);
         }
 
         let distance_by_key: HashMap<&str, f64> =
             knn.iter().map(|(k, d)| (k.as_str(), *d)).collect();
-        let placeholders = vec!["?"; knn.len()].join(",");
-        let collection_filter = if collection.is_some() {
-            format!(" AND d.collection = ?{}", knn.len() + 1)
-        } else {
-            String::new()
-        };
+        let keys: Vec<&str> = knn.iter().map(|(k, _)| k.as_str()).collect();
+        let (collection_filter, scope_params) = scope.where_sql();
         let sql = format!(
             "SELECT
                cv.hash || '_' || cv.seq,
@@ -482,15 +550,14 @@ impl Store {
              FROM content_vectors cv
              JOIN documents d ON d.hash = cv.hash AND d.active = 1
              JOIN content ON content.hash = d.hash
-             WHERE cv.hash || '_' || cv.seq IN ({placeholders}){collection_filter}"
+             WHERE cv.hash || '_' || cv.seq IN (SELECT value FROM json_each(?)){collection_filter}"
         );
         let mut stmt = self.conn().prepare(&sql)?;
-        let params_vec: Vec<&str> = knn
-            .iter()
-            .map(|(k, _)| k.as_str())
-            .chain(collection.iter().copied())
-            .collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |r| {
+        let mut params = vec![SqlValue::Text(
+            serde_json::to_string(&keys).expect("keys serialize"),
+        )];
+        params.extend(scope_params);
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
             Ok(VecRow {
                 hash_seq: r.get(0)?,
                 hash: r.get(1)?,
@@ -526,7 +593,31 @@ impl Store {
                 }
             }
         }
-        Ok((knn.len(), best))
+        Ok(best)
+    }
+}
+
+/// What a vector search is restricted to.
+struct VecScope<'a> {
+    collection: Option<&'a str>,
+    filter: Option<&'a MetadataFilter>,
+}
+
+impl VecScope<'_> {
+    /// The `AND ...` restriction over `documents d`, and its bindings.
+    fn where_sql(&self) -> (String, Vec<SqlValue>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        if let Some(c) = self.collection {
+            sql.push_str(" AND d.collection = ?");
+            params.push(SqlValue::Text(c.to_owned()));
+        }
+        if let Some(filter) = self.filter {
+            let compiled = super::metadata::search_filter_sql(filter);
+            sql.push_str(&compiled.sql);
+            params.extend(compiled.params);
+        }
+        (sql, params)
     }
 }
 

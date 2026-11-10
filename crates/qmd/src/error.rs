@@ -26,6 +26,12 @@ pub enum Error {
     )]
     DbPathNotSet,
 
+    #[error(transparent)]
+    Metadata(#[from] crate::metadata::MetadataError),
+
+    #[error(transparent)]
+    MetadataFilter(#[from] crate::metadata::FilterError),
+
     #[error("{0}")]
     Other(String),
 }

@@ -4,10 +4,12 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::params;
+use rusqlite::params_from_iter;
+use rusqlite::types::Value as SqlValue;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::metadata::MetadataFilter;
 use crate::store::Store;
 use crate::store::sections::{SectionRef, section_id};
 
@@ -262,21 +264,37 @@ impl Store {
         collection: Option<&str>,
         mode: TermMatch,
     ) -> Result<Vec<SearchResult>> {
+        self.search_fts_filtered(query, limit, collection, mode, None)
+    }
+
+    /// [`Store::search_fts_with`] restricted to documents a metadata
+    /// `filter` admits. A filtered search ranks the whole match set, not a
+    /// top-k window, so a matching document below stronger non-matching
+    /// ones is still found.
+    pub fn search_fts_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        collection: Option<&str>,
+        mode: TermMatch,
+        filter: Option<&MetadataFilter>,
+    ) -> Result<Vec<SearchResult>> {
         let Some(fts_query) = build_fts5_query_with(query, mode) else {
             return Ok(Vec::new());
         };
+        let scope = Scope { collection, filter };
 
         let levels = self.section_levels()?;
         let mut results = if levels.is_empty() {
-            self.search_documents_fts(&fts_query, limit, collection, false)?
+            self.search_documents_fts(&fts_query, limit, &scope, false)?
         } else {
             let in_sections = |c: &str| levels.contains_key(c);
             let mut results = Vec::new();
             if collection.is_none_or(|c| !in_sections(c)) {
-                results = self.search_documents_fts(&fts_query, limit, collection, true)?;
+                results = self.search_documents_fts(&fts_query, limit, &scope, true)?;
             }
             if collection.is_none_or(in_sections) {
-                results.extend(self.search_sections_fts(&fts_query, limit, collection)?);
+                results.extend(self.search_sections_fts(&fts_query, limit, &scope)?);
                 results.sort_by(|a, b| b.score.total_cmp(&a.score));
                 results.truncate(limit);
             }
@@ -295,33 +313,24 @@ impl Store {
         &self,
         fts_query: &str,
         limit: usize,
-        collection: Option<&str>,
+        scope: &Scope<'_>,
         skip_sections: bool,
     ) -> Result<Vec<SearchResult>> {
-        let fts_limit = if collection.is_some() {
-            limit.saturating_mul(10)
-        } else {
-            limit
-        };
-
-        let mut collection_filter = if collection.is_some() {
-            " AND d.collection = ?2".to_owned()
-        } else {
-            String::new()
-        };
+        let (mut collection_filter, params) = scope.where_sql(fts_query);
         if skip_sections {
             collection_filter.push_str(
                 " AND NOT EXISTS (SELECT 1 FROM store_config \
                  WHERE key = 'section_level:' || d.collection)",
             );
         }
+        let fts_limit = scope.fts_limit(limit);
         let sql = format!(
             "WITH fts_matches AS (
                SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
                FROM documents_fts
                WHERE documents_fts MATCH ?1
                ORDER BY bm25_score ASC
-               LIMIT {fts_limit}
+               {fts_limit}
              )
              SELECT
                'qmd://' || d.collection || '/' || d.path,
@@ -356,15 +365,48 @@ impl Store {
                 section: None,
             })
         };
-        let rows: Vec<SearchResult> = match collection {
-            Some(c) => stmt
-                .query_map(params![fts_query, c], map_row)?
-                .collect::<std::result::Result<_, _>>()?,
-            None => stmt
-                .query_map(params![fts_query], map_row)?
-                .collect::<std::result::Result<_, _>>()?,
-        };
+        let rows: Vec<SearchResult> = stmt
+            .query_map(params_from_iter(params), map_row)?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+}
+
+/// What a BM25 search is restricted to: one collection, a metadata filter.
+pub(crate) struct Scope<'a> {
+    pub collection: Option<&'a str>,
+    pub filter: Option<&'a MetadataFilter>,
+}
+
+impl Scope<'_> {
+    /// The `AND ...` restriction over `documents d` and every binding of the
+    /// statement, `fts_query` first as `?1`.
+    pub fn where_sql(&self, fts_query: &str) -> (String, Vec<SqlValue>) {
+        let mut sql = String::new();
+        let mut params = vec![SqlValue::Text(fts_query.to_owned())];
+        if let Some(c) = self.collection {
+            sql.push_str(" AND d.collection = ?2");
+            params.push(SqlValue::Text(c.to_owned()));
+        }
+        if let Some(filter) = self.filter {
+            let compiled = super::metadata::search_filter_sql(filter);
+            sql.push_str(&compiled.sql);
+            params.extend(compiled.params);
+        }
+        (sql, params)
+    }
+
+    /// The candidate window of the FTS CTE. A collection scope fetches extra
+    /// candidates, since some will be dropped; a metadata filter ranks the
+    /// whole match set, so the filter, not the window, decides what is left.
+    pub fn fts_limit(&self, limit: usize) -> String {
+        if self.filter.is_some() {
+            String::new()
+        } else if self.collection.is_some() {
+            format!("LIMIT {}", limit.saturating_mul(10))
+        } else {
+            format!("LIMIT {limit}")
+        }
     }
 }
 

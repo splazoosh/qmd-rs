@@ -6,8 +6,8 @@
 //! - `/mcp` — MCP over Streamable HTTP, with sessions. rmcp's transport.
 //! - `POST /query` (alias `/search`) — the `query` tool's parameters in, its
 //!   structured rows out, without the protocol.
-//! - `GET /health` — liveness, plus the PID that `qmd mcp stop` checks a PID
-//!   file against before it kills anything.
+//! - `GET /health` — liveness, the PID that `qmd mcp stop` checks a PID file
+//!   against before it kills anything, and the embedder's state.
 //!
 //! Loopback only. The listener refuses a non-loopback address, and every route
 //! sits behind a DNS-rebinding guard: the `Host` must name a loopback host and
@@ -33,7 +33,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::QmdServer;
-use crate::tools::{self, QueryParams};
+use crate::tools::{self, MetadataParams, QueryParams};
 use crate::worker::Index;
 
 /// Default port, upstream's.
@@ -130,14 +130,19 @@ fn router(server: QmdServer, cancel: CancellationToken) -> Router {
         .route("/health", get(health))
         .route("/query", post(query))
         .route("/search", post(query))
+        .route("/metadata", post(metadata))
         .nest_service("/mcp", mcp)
         .with_state(state)
         .layer(middleware::from_fn(guard_and_log))
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let embedder = state.server.worker().health();
+    let failure = embedder.failure();
     Json(json!({
-        "status": "ok",
+        "status": if failure.is_some() { "degraded" } else { "ok" },
+        "embedder": embedder.label(),
+        "embedderError": failure,
         "pid": std::process::id(),
         "uptime": state.started.elapsed().as_secs(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -152,6 +157,23 @@ async fn query(State(state): State<AppState>, Json(params): Json<QueryParams>) -
         .await
     {
         Ok((output, _summary)) => Json(output).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /metadata`: the `metadata` tool's report, with its body.
+async fn metadata(State(state): State<AppState>, Json(params): Json<MetadataParams>) -> Response {
+    match state
+        .server
+        .worker()
+        .run(move |index: &mut Index| tools::metadata(index, &params))
+        .await
+    {
+        Ok((report, _text)) => Json(report).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("{e:#}") })),

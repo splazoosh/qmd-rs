@@ -22,6 +22,10 @@ pub struct ReindexResult {
     /// Directory entries the walk could not read. When non-zero no document
     /// was deactivated, since a missing file may only be unreadable.
     pub walk_errors: usize,
+    /// Files whose frontmatter failed extraction this pass; they index, but
+    /// filtered search excludes them until fixed. An unchanged file is not
+    /// re-extracted, so the standing set is [`Store::metadata_failures`].
+    pub metadata_errors: usize,
 }
 
 fn system_time_iso(t: std::io::Result<SystemTime>, fallback: &str) -> String {
@@ -103,7 +107,7 @@ fn sync_files(
         let hash = crate::store::hash_content(&content);
         let title = crate::store::extract_title(&content, relative);
 
-        match store.find_or_migrate_document(collection_name, relative, &walked)? {
+        let extraction = match store.find_or_migrate_document(collection_name, relative, &walked)? {
             Some((id, existing_hash, existing_title)) => {
                 if existing_hash == hash {
                     if existing_title == title {
@@ -112,6 +116,7 @@ fn sync_files(
                         store.update_document_title(id, &title, &now)?;
                         result.updated += 1;
                     }
+                    store.sync_document_metadata(id, &content, relative, true)?
                 } else {
                     store.insert_content(&hash, &content, &now)?;
                     let modified = system_time_iso(
@@ -120,6 +125,7 @@ fn sync_files(
                     );
                     store.update_document(id, &title, &hash, &modified)?;
                     result.updated += 1;
+                    store.sync_document_metadata(id, &content, relative, false)?
                 }
             }
             None => {
@@ -148,7 +154,16 @@ fn sync_files(
                     &modified,
                 )?;
                 result.indexed += 1;
+                match store.find_active_document(collection_name, relative)? {
+                    Some((id, _, _)) => {
+                        store.sync_document_metadata(id, &content, relative, false)?
+                    }
+                    None => None,
+                }
             }
+        };
+        if extraction.is_some_and(|e| e.error.is_some()) {
+            result.metadata_errors += 1;
         }
     }
 

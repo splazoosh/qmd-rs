@@ -483,7 +483,10 @@ impl Store {
         let Some(mut d) = doc else {
             return Ok(None);
         };
-        d.context = self.context_for_file(&d.filepath)?;
+        d.context = self.context_for_file(
+            &d.collection_name,
+            super::relative_path(&d.filepath, &d.collection_name),
+        )?;
         Ok(Some((Box::new(d), matched)))
     }
 
@@ -511,10 +514,7 @@ impl Store {
         let mut matched = Vec::new();
         for row in rows {
             let doc = row?;
-            let relative = doc
-                .display_path
-                .split_once('/')
-                .map_or("", |(_, rest)| rest);
+            let relative = super::relative_path(&doc.filepath, &doc.collection_name);
             if glob.is_match(&doc.filepath)
                 || glob.is_match(relative)
                 || glob.is_match(&doc.display_path)
@@ -523,7 +523,10 @@ impl Store {
             }
         }
         for doc in &mut matched {
-            doc.context = self.context_for_file(&doc.filepath)?;
+            doc.context = self.context_for_file(
+                &doc.collection_name,
+                super::relative_path(&doc.filepath, &doc.collection_name),
+            )?;
         }
         Ok(matched)
     }
@@ -690,6 +693,7 @@ mod tests {
             pattern: "**/*.md".to_owned(),
             ignore: None,
             context: None,
+            metadata: None,
             update: None,
             include_by_default: None,
             chunk_tokens: None,

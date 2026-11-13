@@ -241,6 +241,18 @@ pub struct NumberRange {
 pub struct MetadataValueCount {
     pub value: Scalar,
     pub documents: u64,
+    /// Of `documents`, those that inherit the value, by level, most first;
+    /// the rest declare it themselves. Empty when none inherits it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<SourceCount>,
+}
+
+/// Documents that inherit one value from one level
+/// ([`crate::metadata::inherit::level_label`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub documents: u64,
 }
 
 /// A key's name, coverage and types, without values: what status views show.

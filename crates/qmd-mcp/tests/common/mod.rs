@@ -28,17 +28,24 @@ impl Fixture {
     /// The fixture with `recipes` set to section documents at `level`, and
     /// a two-section `recipes/soup.md`.
     pub fn build_with(recipe_sections: Option<u8>) -> Self {
-        Self::build_full(recipe_sections, false)
+        Self::build_full(recipe_sections, false, false)
     }
 
     /// The fixture plus two `notes/meta/` documents declaring `qmd.metadata`:
     /// `published.md` (status published, priority 5, topics [raft, consensus])
     /// and `draft.md` (status draft, priority 1), both about leader election.
     pub fn with_metadata() -> Self {
-        Self::build_full(None, true)
+        Self::build_full(None, true, false)
     }
 
-    fn build_full(recipe_sections: Option<u8>, metadata: bool) -> Self {
+    /// [`Self::with_metadata`] plus inherited metadata: `area: elections`
+    /// declared for `qmd://notes/meta/`, and `team: core` for every
+    /// collection, which `published.md`'s own `team: docs` overrides.
+    pub fn with_inherited_metadata() -> Self {
+        Self::build_full(None, true, true)
+    }
+
+    fn build_full(recipe_sections: Option<u8>, metadata: bool, inherited: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -46,8 +53,11 @@ impl Fixture {
         if metadata {
             write(
                 &notes.join("meta/published.md"),
-                "---\nqmd:\n  metadata:\n    status: published\n    priority: 5\n    \
-                 topics: [raft, consensus]\n---\n\n# Election Notes\n\nLeader election needs a quorum.\n",
+                &format!(
+                    "---\nqmd:\n  metadata:\n    status: published\n    priority: 5\n    \
+                     topics: [raft, consensus]\n{}---\n\n# Election Notes\n\nLeader election needs a quorum.\n",
+                    if inherited { "    team: docs\n" } else { "" }
+                ),
             );
             write(
                 &notes.join("meta/draft.md"),
@@ -89,6 +99,7 @@ impl Fixture {
                 pattern: "**/*.md".to_owned(),
                 ignore: None,
                 context: Some(context),
+                metadata: None,
                 update: None,
                 include_by_default: Some(true),
                 chunk_tokens: None,
@@ -103,6 +114,7 @@ impl Fixture {
                 pattern: "**/*.md".to_owned(),
                 ignore: None,
                 context: None,
+                metadata: None,
                 update: None,
                 include_by_default: Some(true),
                 chunk_tokens: None,
@@ -110,6 +122,11 @@ impl Fixture {
                 section_level: recipe_sections,
             },
         );
+
+        if inherited {
+            assert!(config.set_metadata(Some("notes"), "/meta", "area", "elections".into()));
+            assert!(config.set_metadata(None, "/", "team", "core".into()));
+        }
 
         let config_path = root.join("index.yml");
         qmd::config::save_config(&config_path, &config).unwrap();

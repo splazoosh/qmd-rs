@@ -22,6 +22,7 @@
 mod extract;
 pub mod filter;
 pub mod format;
+pub mod inherit;
 pub mod report;
 
 use std::fmt;
@@ -29,8 +30,11 @@ use std::fmt;
 use indexmap::IndexMap;
 use serde::{Serialize, Serializer};
 
-pub use extract::{ExtractionResult, extract_document_metadata};
+pub use extract::{
+    ExtractionResult, extract_document_metadata, normalize_metadata_json, parse_metadata_value,
+};
 pub use filter::{FilterError, MetadataFilter, MetadataMatch};
+pub use inherit::{Inherited, InheritedLayers, MetadataSources, ResolvedMetadata};
 pub use report::{
     ListMetadataOptions, ListMetadataResult, MetadataError, MetadataFailure, MetadataKeyOverview,
     MetadataOverview,

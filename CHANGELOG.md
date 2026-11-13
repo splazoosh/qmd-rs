@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0
+
+- Inherited metadata: `qmd metadata set <path> key=value...`, `list` and `rm`
+  declare `qmd.metadata` for every collection, one collection or a folder,
+  stored in `index.yml` (`global_metadata`, a collection's `metadata` by
+  prefix). `qmd update` resolves each document's levels under its own
+  frontmatter, the most specific level winning per key, and re-resolves the
+  documents under a changed level with no file touched. `--filter`,
+  discovery and results treat inherited keys as declared; JSON, MCP and REST
+  results add `metadataSources`, `--explain` names each inherited key's
+  level, and `collection metadata` reports each value's inherited share. An
+  index without inherited metadata reads and filters as before.
+- A collection whose name holds `/` now gets its own path context rather
+  than that of the collection named by its first segment.
+
 ## 0.6.0
 
 - Document metadata, as in qmd after its v2.8.3 release (commit 86d2365). A

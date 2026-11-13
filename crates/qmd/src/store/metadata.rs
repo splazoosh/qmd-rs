@@ -19,12 +19,13 @@ use crate::error::Result;
 use crate::metadata::filter::{CompiledSql, FilterScope};
 use crate::metadata::report::{
     MetadataFailure, MetadataKeySummary, MetadataKeyTypeSummary, MetadataValueCount, NumberRange,
-    SQL_BINDING_BUDGET, ValueSort, Window,
+    SQL_BINDING_BUDGET, SourceCount, ValueSort, Window,
 };
 use crate::metadata::{
-    DocumentMetadata, ExtractionResult, ListMetadataOptions, ListMetadataResult,
+    ExtractionResult, Inherited, ListMetadataOptions, ListMetadataResult,
     METADATA_EXTRACTION_VERSION, MetadataError, MetadataFilter, MetadataKeyOverview,
-    MetadataOverview, Scalar, ValueType, extract_document_metadata, parse_metadata_json,
+    MetadataOverview, MetadataSources, ResolvedMetadata, Scalar, ValueType,
+    extract_document_metadata, parse_metadata_json,
 };
 use crate::store::{Store, now_iso};
 
@@ -67,6 +68,20 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
            ON document_metadata_values(key, boolean_value, document_id)
            WHERE value_type = 'boolean';",
     )?;
+    for (table, column) in [
+        ("document_metadata", "inherited_hash"),
+        ("document_metadata", "sources_json"),
+        ("document_metadata_values", "source"),
+    ] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+        }
+    }
     Ok(())
 }
 
@@ -130,21 +145,55 @@ impl Store {
         path: &str,
         only_if_stale: bool,
     ) -> Result<Option<ExtractionResult>> {
+        self.sync_document_metadata_inheriting(
+            id,
+            content,
+            path,
+            only_if_stale,
+            &Inherited::default(),
+        )
+    }
+
+    /// [`Self::sync_document_metadata`] for a document that inherits
+    /// `inherited`: the file's frontmatter over it. A document is stale when
+    /// its extraction is from another version or what it inherits has
+    /// changed since it was resolved. A failed extraction inherits nothing,
+    /// as it declares nothing: filtered search excludes it either way.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn sync_document_metadata_inheriting(
+        &self,
+        id: i64,
+        content: &str,
+        path: &str,
+        only_if_stale: bool,
+        inherited: &Inherited,
+    ) -> Result<Option<ExtractionResult>> {
+        let fingerprint = inherited.fingerprint();
         if only_if_stale {
-            let version: Option<i64> = self
+            let current: Option<bool> = self
                 .conn()
                 .query_row(
-                    "SELECT extraction_version FROM document_metadata WHERE document_id = ?1",
-                    params![id],
+                    "SELECT extraction_version = ?2 AND inherited_hash IS ?3
+                     FROM document_metadata WHERE document_id = ?1",
+                    params![id, METADATA_EXTRACTION_VERSION, fingerprint],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if version == Some(METADATA_EXTRACTION_VERSION) {
+            if current == Some(true) {
                 return Ok(None);
             }
         }
-        let extraction = extract_document_metadata(content, path);
-        self.replace_document_metadata(id, &extraction)?;
+        let mut extraction = extract_document_metadata(content, path);
+        let sources = if extraction.error.is_none() {
+            let resolved = inherited.merge(std::mem::take(&mut extraction.metadata));
+            extraction.metadata = resolved.metadata;
+            resolved.sources
+        } else {
+            MetadataSources::new()
+        };
+        self.write_document_metadata(id, &extraction, &sources, fingerprint.as_deref())?;
         Ok(Some(extraction))
     }
 
@@ -156,6 +205,18 @@ impl Store {
     /// # Errors
     /// Propagates SQLite failures.
     pub fn replace_document_metadata(&self, id: i64, extraction: &ExtractionResult) -> Result<()> {
+        self.write_document_metadata(id, extraction, &MetadataSources::new(), None)
+    }
+
+    /// Store a document's resolved metadata: `sources` names the level of
+    /// each inherited key, `fingerprint` what it inherited.
+    fn write_document_metadata(
+        &self,
+        id: i64,
+        extraction: &ExtractionResult,
+        sources: &MetadataSources,
+        fingerprint: Option<&str>,
+    ) -> Result<()> {
         let tx = if self.conn().is_autocommit() {
             Some(self.conn().unchecked_transaction()?)
         } else {
@@ -163,19 +224,25 @@ impl Store {
         };
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO document_metadata (document_id, metadata_json, extraction_version,
+               extraction_error, extracted_at, inherited_hash, sources_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(document_id) DO UPDATE SET
                metadata_json = excluded.metadata_json,
                extraction_version = excluded.extraction_version,
                extraction_error = excluded.extraction_error,
-               extracted_at = excluded.extracted_at",
+               extracted_at = excluded.extracted_at,
+               inherited_hash = excluded.inherited_hash,
+               sources_json = excluded.sources_json",
             params![
                 id,
                 serde_json::to_string(&extraction.metadata).expect("metadata serializes"),
                 extraction.extraction_version,
                 extraction.error,
                 now_iso(),
+                fingerprint,
+                (!sources.is_empty())
+                    .then(|| serde_json::to_string(sources).expect("sources serialize")),
             ],
         )?;
         conn.execute(
@@ -185,10 +252,11 @@ impl Store {
         {
             let mut insert = conn.prepare(
                 "INSERT INTO document_metadata_values
-                   (document_id, key, ordinal, value_type, text_value, number_value, boolean_value)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                   (document_id, key, ordinal, value_type, text_value, number_value, boolean_value, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for (key, value) in &extraction.metadata {
+                let source = sources.get(key);
                 for (ordinal, scalar) in value.scalars().iter().enumerate() {
                     let (text, number, boolean) = match scalar {
                         Scalar::String(s) => (Some(s.as_str()), None, None),
@@ -203,6 +271,7 @@ impl Store {
                         text,
                         number,
                         boolean,
+                        source,
                     ])?;
                 }
             }
@@ -285,24 +354,36 @@ impl Store {
     pub fn metadata_by_filepath(
         &self,
         filepaths: &[String],
-    ) -> Result<HashMap<String, DocumentMetadata>> {
+    ) -> Result<HashMap<String, ResolvedMetadata>> {
         if filepaths.is_empty() {
             return Ok(HashMap::new());
         }
         let mut stmt = self.conn().prepare(
-            "SELECT 'qmd://' || d.collection || '/' || d.path, dm.metadata_json
+            "SELECT 'qmd://' || d.collection || '/' || d.path, dm.metadata_json, dm.sources_json
              FROM documents d JOIN document_metadata dm ON dm.document_id = d.id
              WHERE d.active = 1
                AND 'qmd://' || d.collection || '/' || d.path IN (SELECT value FROM json_each(?1))",
         )?;
         let json = serde_json::to_string(filepaths).expect("paths serialize");
         let rows = stmt.query_map(params![json], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?;
         let mut out = HashMap::new();
         for row in rows {
-            let (path, json) = row?;
-            out.insert(path, parse_metadata_json(json.as_deref()));
+            let (path, json, sources) = row?;
+            out.insert(
+                path,
+                ResolvedMetadata {
+                    metadata: parse_metadata_json(json.as_deref()),
+                    sources: sources
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                },
+            );
         }
         Ok(out)
     }
@@ -668,8 +749,19 @@ fn read_report(
                 s.values.push(MetadataValueCount {
                     value: row.value,
                     documents: row.documents,
+                    inherited: Vec::new(),
                 });
             }
+        }
+    }
+    for (key, value_type, value, count) in value_sources(conn, &region)? {
+        if let Some(&(i, j)) = position.get(&(key, value_type))
+            && let Some(v) = summaries[i].1[j]
+                .values
+                .iter_mut()
+                .find(|v| v.value == value)
+        {
+            v.inherited.push(count);
         }
     }
     let value_offset = u64::try_from(window.value_offset).unwrap_or(0);
@@ -801,6 +893,44 @@ fn midpoint(lower: f64, upper: f64) -> f64 {
     } else {
         lower / 2.0 + upper / 2.0
     }
+}
+
+/// Documents inheriting each value, per level, most first. Rows a file
+/// declares carry no source, so an index without inherited metadata yields
+/// none.
+fn value_sources(
+    conn: &Connection,
+    region: &Region,
+) -> Result<Vec<(String, ValueType, Scalar, SourceCount)>> {
+    let sql = format!(
+        "{}
+         SELECT mv.key, mv.value_type, mv.text_value, mv.number_value, mv.boolean_value,
+           mv.source, COUNT(DISTINCT mv.document_id) AS documents
+         {}
+         WHERE mv.source IS NOT NULL
+         GROUP BY mv.key, mv.value_type, mv.text_value, mv.number_value, mv.boolean_value, mv.source
+         ORDER BY mv.key, mv.value_type, documents DESC, mv.source",
+        region.with_sql, region.from_sql
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(region.params()), |r| {
+        let value_type = value_type_of(&r.get::<_, String>(1)?);
+        let value = match value_type {
+            ValueType::String => Scalar::String(r.get(2)?),
+            ValueType::Number => Scalar::Number(r.get(3)?),
+            ValueType::Boolean => Scalar::Boolean(r.get::<_, i64>(4)? == 1),
+        };
+        Ok((
+            r.get::<_, String>(0)?,
+            value_type,
+            value,
+            SourceCount {
+                source: r.get(5)?,
+                documents: u64::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 struct ValueCountRow {

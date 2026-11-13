@@ -471,6 +471,65 @@ async fn section_documents_are_the_hits_and_get_reads_one() {
 }
 
 #[tokio::test]
+async fn query_filters_on_inherited_metadata_and_names_its_level() {
+    let fixture = Fixture::with_inherited_metadata();
+    let (client, _) = connect(&fixture).await;
+
+    let area = json!({"field": "area", "operator": "eq", "value": "elections"});
+    let result = call(
+        &client,
+        "query",
+        json!({ "searches": [{ "type": "lex", "query": "quorum election" }], "filter": area, "explain": true }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let text = text_of(&result);
+    let rows = result.structured_content.unwrap()["results"].clone();
+    let mut files: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["file"].as_str().unwrap())
+        .collect();
+    files.sort_unstable();
+    assert_eq!(files, ["notes/meta/draft.md", "notes/meta/published.md"]);
+    let published = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["file"] == "notes/meta/published.md")
+        .unwrap();
+    assert_eq!(published["metadata"]["team"], "docs");
+    assert_eq!(
+        published["metadataSources"],
+        json!({"area": "qmd://notes/meta/"}),
+        "team is the file's own"
+    );
+    assert!(
+        text.contains("inherited metadata: team from global, area from qmd://notes/meta/"),
+        "{text}"
+    );
+
+    let team = json!({"field": "team", "operator": "eq", "value": "core"});
+    let result = call(
+        &client,
+        "query",
+        json!({ "searches": [{ "type": "lex", "query": "stock election" }], "filter": team }),
+    )
+    .await;
+    let rows = result.structured_content.unwrap()["results"].clone();
+    let files: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["file"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"recipes/stock.md"), "{files:?}");
+    assert!(!files.contains(&"notes/meta/published.md"), "{files:?}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn query_applies_a_metadata_filter_and_returns_the_metadata() {
     let fixture = Fixture::with_metadata();
     let (client, _) = connect(&fixture).await;

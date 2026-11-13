@@ -753,7 +753,19 @@ fn context_target(app: &App, arg: Option<&str>) -> Result<ContextTarget> {
         return Ok(ContextTarget::Global);
     }
     if let Some(rest) = arg.strip_prefix("qmd://") {
-        let (collection, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let named = app
+            .config
+            .collections
+            .keys()
+            .filter(|name| {
+                rest.strip_prefix(name.as_str())
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+            })
+            .max_by_key(|name| name.len());
+        let (collection, path) = match named {
+            Some(name) => (name.as_str(), &rest[name.len()..]),
+            None => rest.split_once('/').unwrap_or((rest, "")),
+        };
         require_collection(app, collection)?;
         return Ok(ContextTarget::Prefix {
             collection: collection.to_owned(),
@@ -882,6 +894,112 @@ pub fn context_list(location: &IndexLocation) -> Result<()> {
     if !any {
         println!(
             "No contexts. Add one with: qmd context add qmd://<collection>/ \"what it holds\""
+        );
+    }
+    Ok(())
+}
+
+impl ContextTarget {
+    /// The `(collection, prefix)` a config metadata level is addressed by.
+    fn level(&self) -> (Option<&str>, &str) {
+        match self {
+            Self::Global => (None, "/"),
+            Self::Prefix { collection, prefix } => (Some(collection.as_str()), prefix.as_str()),
+        }
+    }
+}
+
+/// `qmd metadata set PATH KEY=VALUE...`: declare metadata every document
+/// under PATH inherits. Each VALUE is YAML and follows frontmatter's rules.
+pub fn metadata_set(location: &IndexLocation, path: &str, assignments: &[String]) -> Result<()> {
+    let mut app = open(location)?;
+    let target = context_target(&app, Some(path))?;
+    let (collection, prefix) = target.level();
+    let mut keys = Vec::new();
+    for assignment in assignments {
+        let Some((key, value)) = assignment.split_once('=') else {
+            bail!("expected KEY=VALUE, got '{assignment}'");
+        };
+        let value = qmd::metadata::parse_metadata_value(key, value).map_err(|e| anyhow!(e))?;
+        let value = serde_json::to_value(&value).expect("metadata serializes");
+        app.config.set_metadata(collection, prefix, key, value);
+        keys.push(key.to_owned());
+    }
+    if let Some(level) = app.config.metadata_level(collection, prefix) {
+        qmd::metadata::normalize_metadata_json(level).map_err(|e| anyhow!(e))?;
+    }
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!(
+        "✓ Set {} for {}; run 'qmd update' to apply it",
+        keys.join(", "),
+        target.display()
+    );
+    Ok(())
+}
+
+/// `qmd metadata rm PATH [KEY...]`: remove keys from a level, or the level.
+pub fn metadata_remove(location: &IndexLocation, path: &str, keys: &[String]) -> Result<()> {
+    let mut app = open(location)?;
+    let target = context_target(&app, Some(path))?;
+    let (collection, prefix) = target.level();
+    let removed = app.config.remove_metadata(collection, prefix, keys);
+    if removed == 0 {
+        bail!(
+            "no such metadata set for {} (run 'qmd metadata list')",
+            target.display()
+        );
+    }
+    config::save_config(&app.config_path, &app.config)?;
+    app.store.sync_config_to_db(&app.config)?;
+    println!(
+        "✓ Removed {removed} key(s) from {}; run 'qmd update' to apply it",
+        target.display()
+    );
+    Ok(())
+}
+
+/// `qmd metadata list`: every level, least specific first.
+pub fn metadata_list(location: &IndexLocation) -> Result<()> {
+    let app = open_without_sync(location)?;
+    let c = colors();
+    let print_level = |target: &ContextTarget, level: &config::MetadataMap| {
+        println!("{}{}{}", c.cyan, target.display(), c.reset);
+        for (key, value) in level {
+            println!("  {key}: {value}");
+        }
+    };
+    let mut any = false;
+    if let Some(level) = app
+        .config
+        .global_metadata
+        .as_ref()
+        .filter(|m| !m.is_empty())
+    {
+        print_level(&ContextTarget::Global, level);
+        any = true;
+    }
+    for (name, coll) in &app.config.collections {
+        let mut levels: Vec<(String, &config::MetadataMap)> = coll
+            .metadata
+            .iter()
+            .flatten()
+            .filter(|(_, level)| !level.is_empty())
+            .map(|(prefix, level)| (config::normalize_context_prefix(prefix), level))
+            .collect();
+        levels.sort_by(|a, b| a.0.cmp(&b.0));
+        for (prefix, level) in levels {
+            let target = ContextTarget::Prefix {
+                collection: name.clone(),
+                prefix,
+            };
+            print_level(&target, level);
+            any = true;
+        }
+    }
+    if !any {
+        println!(
+            "No inherited metadata. Declare some with: qmd metadata set qmd://<collection>/ key=value"
         );
     }
     Ok(())
@@ -1294,14 +1412,17 @@ fn warn_pending_metadata(app: &App, collections: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The indexed metadata of results, for JSON output.
+/// The indexed metadata of results, for JSON output and `--explain`.
 fn result_metadata<T>(
     app: &App,
     format: format::OutputFormat,
     results: &[T],
     filepath: impl Fn(&T) -> &str,
 ) -> Result<format::Metadata> {
-    if format != format::OutputFormat::Json {
+    if !matches!(
+        format,
+        format::OutputFormat::Json | format::OutputFormat::Cli
+    ) {
         return Ok(format::Metadata::new());
     }
     let paths: Vec<String> = results.iter().map(|r| filepath(r).to_owned()).collect();

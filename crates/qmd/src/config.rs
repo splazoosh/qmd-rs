@@ -16,6 +16,14 @@ use crate::store::TermMatch;
 /// Context definitions for a collection: path prefix -> description.
 pub type ContextMap = IndexMap<String, String>;
 
+/// Metadata declared for a level: key -> value, under frontmatter's rules
+/// ([`crate::metadata::normalize_metadata_json`]).
+pub type MetadataMap = IndexMap<String, serde_json::Value>;
+
+/// A collection's metadata levels: normalized path prefix (`/` the whole
+/// collection) -> metadata its documents inherit.
+pub type MetadataPrefixMap = IndexMap<String, MetadataMap>;
+
 /// A single collection configuration (one entry in `index.yml`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Collection {
@@ -30,6 +38,9 @@ pub struct Collection {
     /// Optional context definitions (path prefix -> text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextMap>,
+    /// Metadata its documents inherit, by path prefix (`/`: every one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MetadataPrefixMap>,
     /// Optional shell command run during `qmd update`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<String>,
@@ -81,6 +92,7 @@ impl Collection {
             pattern: pattern.into(),
             ignore: None,
             context: None,
+            metadata: None,
             update: None,
             include_by_default: None,
             chunk_tokens: None,
@@ -132,6 +144,9 @@ pub struct SearchConfig {
 pub struct CollectionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_context: Option<String>,
+    /// Metadata every document inherits (the least specific level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_metadata: Option<MetadataMap>,
     #[serde(default)]
     pub collections: IndexMap<String, Collection>,
     /// Model URI overrides (resolution order: config > env var > default).
@@ -330,11 +345,15 @@ impl CollectionConfig {
             .collect()
     }
 
-    /// Add or update a collection, preserving any existing context.
+    /// Add or update a collection, preserving any existing context and
+    /// metadata.
     pub fn add_collection(&mut self, name: &str, path: &str, pattern: &str, ignore: &[String]) {
-        let context = self.collections.get(name).and_then(|c| c.context.clone());
+        let existing = self.collections.get(name);
+        let context = existing.and_then(|c| c.context.clone());
+        let metadata = existing.and_then(|c| c.metadata.clone());
         let mut collection = Collection::new(path, pattern);
         collection.context = context;
+        collection.metadata = metadata;
         collection.ignore = (!ignore.is_empty()).then(|| ignore.to_vec());
         self.collections.insert(name.to_owned(), collection);
     }
@@ -375,6 +394,107 @@ impl CollectionConfig {
             coll.context = None;
         }
         removed
+    }
+
+    /// The metadata declared at one level: global when `collection` is
+    /// `None`, else the collection's normalized `prefix`.
+    pub fn metadata_level(&self, collection: Option<&str>, prefix: &str) -> Option<&MetadataMap> {
+        match collection {
+            None => self.global_metadata.as_ref(),
+            Some(name) => {
+                let prefix = normalize_context_prefix(prefix);
+                self.collections
+                    .get(name)?
+                    .metadata
+                    .as_ref()?
+                    .iter()
+                    .find(|(p, _)| normalize_context_prefix(p) == prefix)
+                    .map(|(_, m)| m)
+            }
+        }
+    }
+
+    /// Set `key` at one level (see [`Self::metadata_level`]). Returns false
+    /// if the collection does not exist.
+    pub fn set_metadata(
+        &mut self,
+        collection: Option<&str>,
+        prefix: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> bool {
+        let level = match collection {
+            None => self.global_metadata.get_or_insert_with(MetadataMap::new),
+            Some(name) => {
+                let Some(coll) = self.collections.get_mut(name) else {
+                    return false;
+                };
+                let prefix = normalize_context_prefix(prefix);
+                let map = coll.metadata.get_or_insert_with(MetadataPrefixMap::new);
+                if let Some(i) = map
+                    .keys()
+                    .position(|p| normalize_context_prefix(p) == prefix)
+                {
+                    let (_, level) = map.shift_remove_index(i).expect("index exists");
+                    map.shift_insert(i, prefix.clone(), level);
+                }
+                map.entry(prefix).or_default()
+            }
+        };
+        level.insert(key.to_owned(), value);
+        true
+    }
+
+    /// Remove `keys` from one level, or the whole level when `keys` is
+    /// empty, dropping emptied maps. Returns how many keys were removed.
+    pub fn remove_metadata(
+        &mut self,
+        collection: Option<&str>,
+        prefix: &str,
+        keys: &[String],
+    ) -> usize {
+        fn strip(level: &mut MetadataMap, keys: &[String]) -> usize {
+            let before = level.len();
+            if keys.is_empty() {
+                level.clear();
+            } else {
+                level.retain(|k, _| !keys.contains(k));
+            }
+            before - level.len()
+        }
+        match collection {
+            None => {
+                let Some(level) = self.global_metadata.as_mut() else {
+                    return 0;
+                };
+                let removed = strip(level, keys);
+                if level.is_empty() {
+                    self.global_metadata = None;
+                }
+                removed
+            }
+            Some(name) => {
+                let Some(map) = self
+                    .collections
+                    .get_mut(name)
+                    .and_then(|c| c.metadata.as_mut())
+                else {
+                    return 0;
+                };
+                let prefix = normalize_context_prefix(prefix);
+                let mut removed = 0;
+                for (p, level) in map.iter_mut() {
+                    if normalize_context_prefix(p) == prefix {
+                        removed += strip(level, keys);
+                    }
+                }
+                map.retain(|_, level| !level.is_empty());
+                if map.is_empty() {
+                    self.collections.get_mut(name).expect("present").metadata = None;
+                }
+                removed
+            }
+        }
     }
 
     /// Rename a collection in place, keeping its position in the file.

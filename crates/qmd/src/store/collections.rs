@@ -6,10 +6,17 @@ use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{ChunkBoundary, ChunkParams, MAX_SECTION_LEVEL, MIN_SECTION_LEVEL};
-use crate::config::{Collection, CollectionConfig, ContextMap, NamedCollection};
+use crate::config::{
+    Collection, CollectionConfig, ContextMap, MetadataMap, MetadataPrefixMap, NamedCollection,
+};
 use crate::error::Result;
+use crate::metadata::inherit::level_label;
+use crate::metadata::{InheritedLayers, normalize_metadata_json};
 use crate::store::Store;
 use crate::store::sections::SECTION_LEVEL;
+
+/// The `store_config` prefix of a collection's inherited metadata.
+const METADATA: &str = "metadata";
 
 /// A collection merged with its database statistics.
 #[derive(Debug, Clone)]
@@ -25,8 +32,10 @@ pub struct CollectionStats {
 }
 
 impl Store {
-    /// All collections mirrored in `store_collections`.
-    pub fn store_collections(&self) -> Result<Vec<NamedCollection>> {
+    /// All collections mirrored in `store_collections`, without `metadata`:
+    /// [`Self::inherited_layers`] is its one reader, so a damaged level fails
+    /// the update rather than every search.
+    pub(crate) fn store_collections(&self) -> Result<Vec<NamedCollection>> {
         let mut stmt = self.conn().prepare(
             "SELECT name, path, pattern, ignore_patterns, include_by_default,
                     update_command, context
@@ -42,8 +51,9 @@ impl Store {
         Ok(named)
     }
 
-    /// One mirrored collection by name.
-    pub fn store_collection(&self, name: &str) -> Result<Option<NamedCollection>> {
+    /// One mirrored collection by name, without `metadata` (see
+    /// [`Self::store_collections`]).
+    pub(crate) fn store_collection(&self, name: &str) -> Result<Option<NamedCollection>> {
         let named = self
             .conn()
             .query_row(
@@ -98,10 +108,11 @@ impl Store {
         self.set_chunk_settings(name, collection)
     }
 
-    /// Chunk size, boundary and section level are kept in `store_config`
-    /// (`chunk_tokens:<collection>`, `chunk_boundary:<collection>`,
-    /// `section_level:<collection>`) rather than new `store_collections`
-    /// columns, so the table stays the TS layout.
+    /// Chunk size, boundary, section level and inherited metadata are kept
+    /// in `store_config` (`chunk_tokens:<collection>`,
+    /// `chunk_boundary:<collection>`, `section_level:<collection>`,
+    /// `metadata:<collection>`) rather than new `store_collections` columns,
+    /// so the table stays the TS layout.
     fn set_chunk_settings(&self, name: &str, collection: &Collection) -> Result<()> {
         self.set_collection_setting(
             "chunk_tokens",
@@ -119,7 +130,55 @@ impl Store {
             collection
                 .section_level
                 .map(|l| l.clamp(MIN_SECTION_LEVEL, MAX_SECTION_LEVEL).to_string()),
+        )?;
+        self.set_collection_setting(
+            METADATA,
+            name,
+            collection
+                .metadata
+                .as_ref()
+                .filter(|m| !m.is_empty())
+                .map(|m| serde_json::to_string(m).expect("metadata serializes")),
         )
+    }
+
+    fn metadata_setting(&self, name: &str) -> Result<Option<MetadataPrefixMap>> {
+        self.collection_setting(METADATA, name)?
+            .map(|v| stored_metadata(&v, &level_label(Some(name), "/")))
+            .transpose()
+    }
+
+    /// The metadata levels documents of `collection` inherit, validated under
+    /// frontmatter's rules.
+    ///
+    /// # Errors
+    /// [`crate::Error::Config`] naming the level whose metadata is invalid
+    /// (an `index.yml` edited by hand); SQLite failures.
+    pub fn inherited_layers(&self, collection: &str) -> Result<InheritedLayers> {
+        let validate = |label: String, raw: &MetadataMap| {
+            normalize_metadata_json(raw)
+                .map_err(|e| crate::Error::Config(format!("metadata for {label}: {e}")))
+        };
+        let global: Option<MetadataMap> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM store_config WHERE key = 'global_metadata'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|v| stored_metadata::<MetadataMap>(&v, &level_label(None, "/")))
+            .transpose()?;
+        let global = global
+            .map(|g| validate(level_label(None, "/"), &g))
+            .transpose()?;
+        let mut prefixes = Vec::new();
+        for (prefix, raw) in self.metadata_setting(collection)?.unwrap_or_default() {
+            let prefix = crate::config::normalize_context_prefix(&prefix);
+            let metadata = validate(level_label(Some(collection), &prefix), &raw)?;
+            prefixes.push((prefix, metadata));
+        }
+        Ok(InheritedLayers::new(collection, global, prefixes))
     }
 
     fn clear_chunk_settings(&self, name: &str) -> Result<()> {
@@ -218,6 +277,20 @@ impl Store {
             }
         }
 
+        match config.global_metadata.as_ref().filter(|m| !m.is_empty()) {
+            Some(metadata) => {
+                self.conn().execute(
+                    "INSERT INTO store_config (key, value) VALUES ('global_metadata', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![serde_json::to_string(metadata).expect("metadata serializes")],
+                )?;
+            }
+            None => {
+                self.conn()
+                    .execute("DELETE FROM store_config WHERE key = 'global_metadata'", [])?;
+            }
+        }
+
         match &config.global_context {
             Some(value) => {
                 self.conn().execute(
@@ -304,7 +377,8 @@ impl Store {
     }
 
     /// Rename a collection in the database: its documents (their FTS rows
-    /// follow by trigger), its mirror row and its chunk settings. Vectors are
+    /// follow by trigger), its mirror row, its chunk and metadata settings
+    /// and the level labels of its inherited metadata. Vectors are
     /// keyed by content hash, so they stay; a hash also held by another
     /// collection may change home and re-embed if the two chunk differently.
     /// Returns the number of documents moved.
@@ -318,25 +392,46 @@ impl Store {
             "UPDATE store_collections SET name = ?2 WHERE name = ?1",
             params![old, new],
         )?;
-        for prefix in ["chunk_tokens", "chunk_boundary", SECTION_LEVEL] {
+        for prefix in ["chunk_tokens", "chunk_boundary", SECTION_LEVEL, METADATA] {
             tx.execute(
                 "UPDATE store_config SET key = ?2 WHERE key = ?1",
                 params![format!("{prefix}:{old}"), format!("{prefix}:{new}")],
             )?;
         }
+        let (old_label, new_label) = (level_label(Some(old), "/"), level_label(Some(new), "/"));
+        tx.execute(
+            "UPDATE document_metadata_values
+               SET source = ?2 || substr(source, length(?1) + 1)
+             WHERE substr(source, 1, length(?1)) = ?1
+               AND document_id IN (SELECT id FROM documents WHERE collection = ?3)",
+            params![old_label, new_label, new],
+        )?;
+        tx.execute(
+            "UPDATE document_metadata SET sources_json = (
+               SELECT json_group_object(j.key, CASE
+                 WHEN substr(j.value, 1, length(?1)) = ?1
+                 THEN ?2 || substr(j.value, length(?1) + 1)
+                 ELSE j.value END)
+               FROM json_each(document_metadata.sources_json) j)
+             WHERE sources_json IS NOT NULL
+               AND document_id IN (SELECT id FROM documents WHERE collection = ?3)",
+            params![old_label, new_label, new],
+        )?;
         tx.commit()?;
         self.sync_sections(None)?;
         Ok(moved)
     }
 
-    /// Context for a file: global context plus all matching path-prefix
-    /// contexts (most general first), joined with blank lines.
-    pub fn context_for_file(&self, filepath: &str) -> Result<Option<String>> {
-        let Some((collection_name, relative_path)) = crate::store::parse_virtual_path(filepath)
-        else {
-            return Ok(None);
-        };
-        let Some(named) = self.store_collection(&collection_name)? else {
+    /// Context for the active document at `relative_path` in `collection_name`:
+    /// global context plus all matching path-prefix contexts (most general
+    /// first), joined with blank lines. Keyed on the pair, not a virtual path,
+    /// since a collection name may hold `/`.
+    pub fn context_for_file(
+        &self,
+        collection_name: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>> {
+        let Some(named) = self.store_collection(collection_name)? else {
             return Ok(None);
         };
 
@@ -357,7 +452,7 @@ impl Store {
             contexts.push(global);
         }
         if let Some(ctx_map) = &named.collection.context {
-            let normalized_path = ensure_leading_slash(&relative_path);
+            let normalized_path = ensure_leading_slash(relative_path);
             let mut matching: Vec<(String, &String)> = ctx_map
                 .iter()
                 .filter_map(|(prefix, context)| {
@@ -374,7 +469,16 @@ impl Store {
     }
 }
 
-fn ensure_leading_slash(path: &str) -> String {
+/// A metadata level as `store_config` holds it. Unreadable means the
+/// database was edited or damaged; dropping the level would strip its keys
+/// from every document on the next update.
+fn stored_metadata<T: serde::de::DeserializeOwned>(json: &str, label: &str) -> Result<T> {
+    serde_json::from_str(json).map_err(|e| {
+        crate::Error::Config(format!("stored metadata for {label} is unreadable: {e}"))
+    })
+}
+
+pub(crate) fn ensure_leading_slash(path: &str) -> String {
     if path.starts_with('/') {
         path.to_owned()
     } else {
@@ -384,7 +488,7 @@ fn ensure_leading_slash(path: &str) -> String {
 
 /// Whether `path` is `prefix` or lies under it on a segment boundary: `/docs`
 /// covers `/docs/a.md`, not `/docs-old/a.md`.
-fn path_under_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn path_under_prefix(path: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     path.strip_prefix(prefix)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -403,6 +507,7 @@ fn row_to_named_collection(r: &rusqlite::Row<'_>) -> rusqlite::Result<NamedColle
             include_by_default: (include_by_default == 0).then_some(false),
             update: r.get(5)?,
             context: context_json.and_then(|j| serde_json::from_str::<ContextMap>(&j).ok()),
+            metadata: None,
             chunk_tokens: None,
             chunk_boundary: None,
             section_level: None,
@@ -421,6 +526,45 @@ mod tests {
         assert!(path_under_prefix("/docs", "/docs"));
         assert!(path_under_prefix("/docs/a.md", "/"));
         assert!(!path_under_prefix("/docs-old/a.md", "/docs"));
+    }
+
+    #[test]
+    fn context_resolves_for_a_collection_name_holding_a_slash() {
+        let store = Store::open_in_memory().unwrap();
+        let mut outer = Collection::new("/a", "**/*.md");
+        outer.context = Some(ContextMap::from([("/".to_owned(), "outer".to_owned())]));
+        let mut inner = Collection::new("/ab", "**/*.md");
+        inner.context = Some(ContextMap::from([(
+            "/docs".to_owned(),
+            "inner docs".to_owned(),
+        )]));
+        store.upsert_store_collection("a", &outer).unwrap();
+        store.upsert_store_collection("a/b", &inner).unwrap();
+        let hash = crate::store::hash_content("# X");
+        store.insert_content(&hash, "# X", "2026-01-01").unwrap();
+        for (c, p) in [("a/b", "docs/x.md"), ("a", "b/docs/x.md")] {
+            store
+                .insert_document(c, p, "X", &hash, "2026-01-01", "2026-01-01")
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .context_for_file("a/b", "docs/x.md")
+                .unwrap()
+                .as_deref(),
+            Some("inner docs")
+        );
+        assert_eq!(
+            store
+                .context_for_file("a", "b/docs/x.md")
+                .unwrap()
+                .as_deref(),
+            Some("outer")
+        );
+        assert_eq!(
+            crate::store::relative_path("qmd://a/b/docs/x.md", "a/b"),
+            "docs/x.md"
+        );
     }
 
     #[test]

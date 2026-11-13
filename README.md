@@ -133,6 +133,24 @@ belongs to each of its sections, so a filter keeps or drops a file's sections
 together. Documents and filters are written as for qmd at commit 86d2365,
 which follows its v2.8.3 release.
 
+Metadata can also be declared above the files, so tagging a folder means no
+file edits. `qmd metadata set <path> key=value...` declares it for every
+collection (`/`), one collection (`qmd://notes/`), or a folder
+(`qmd://notes/guides`, or a directory inside a collection); values are YAML
+and follow frontmatter's rules (`status=draft`, `priority=3`, `tags=[a, b]`).
+`qmd metadata list` shows every level and `qmd metadata rm <path> [key...]`
+removes keys or a whole level; all three edit the `index.yml`
+(`global_metadata`, and a collection's `metadata` by prefix). The next
+`qmd update` applies a change to every document under it, with no file
+touched. The most specific level wins per key: global, the collection, the
+longest matching folder, then the file's own frontmatter, and a value
+replaces the one beneath it whole, arrays included. Filters, discovery and
+results see inherited keys as if the file declared them; JSON and MCP results
+add `metadataSources`, the level of each inherited key (`global`,
+`qmd://notes/`, `qmd://notes/guides/`), `--explain` prints it, and
+`collection metadata` gives each value's inherited share. A file whose
+frontmatter is invalid inherits nothing.
+
 ## Licence
 
 MIT, in [LICENSE](LICENSE). The upstream project's notice is in

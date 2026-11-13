@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 
-use qmd::metadata::DocumentMetadata;
+use qmd::metadata::ResolvedMetadata;
 use qmd::query::{Explain, HybridResult};
 use qmd::snippet::{add_line_numbers, extract_snippet_at};
 use qmd::store::{SearchResult, SectionRef};
@@ -199,9 +199,10 @@ pub fn print_query_results(
     print_result_views(&views, query, format, full, intent, metadata);
 }
 
-/// Each result file's indexed `qmd.metadata`, by `qmd://` path; JSON output
-/// carries it when non-empty.
-pub type Metadata = HashMap<String, DocumentMetadata>;
+/// Each result file's indexed `qmd.metadata` with the level of each
+/// inherited key, by `qmd://` path. JSON output carries both when non-empty
+/// (`metadata`, `metadataSources`); `--explain` prints the sources.
+pub type Metadata = HashMap<String, ResolvedMetadata>;
 
 fn print_result_views(
     results: &[ResultView<'_>],
@@ -234,11 +235,19 @@ fn print_result_views(
                     if let Some(ctx) = r.context {
                         obj.insert("context".into(), ctx.into());
                     }
-                    if let Some(m) = metadata.get(r.filepath).filter(|m| !m.is_empty()) {
-                        obj.insert(
-                            "metadata".into(),
-                            serde_json::to_value(m).expect("metadata serializes"),
-                        );
+                    if let Some(m) = metadata.get(r.filepath) {
+                        if !m.metadata.is_empty() {
+                            obj.insert(
+                                "metadata".into(),
+                                serde_json::to_value(&m.metadata).expect("metadata serializes"),
+                            );
+                        }
+                        if !m.sources.is_empty() {
+                            obj.insert(
+                                "metadataSources".into(),
+                                serde_json::to_value(&m.sources).expect("sources serialize"),
+                            );
+                        }
                     }
                     if full {
                         obj.insert("body".into(), r.body.into());
@@ -324,6 +333,9 @@ fn print_result_views(
                 println!("Score: {}{:.2}{}", c.bold, r.score, c.reset);
                 if let Some(explain) = r.explain {
                     println!("{}Explain:\n{explain}{}", c.dim, c.reset);
+                    if let Some(line) = metadata.get(r.filepath).and_then(inherited_line) {
+                        println!("{}{line}{}", c.dim, c.reset);
+                    }
                 }
                 println!();
                 let content = if full { r.body } else { snippet.text.as_str() };
@@ -334,6 +346,20 @@ fn print_result_views(
             }
         }
     }
+}
+
+/// `Inherited metadata: team from global, area from qmd://notes/docs/`, or
+/// `None` when the document declares every key itself.
+fn inherited_line(m: &ResolvedMetadata) -> Option<String> {
+    if m.sources.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = m
+        .sources
+        .iter()
+        .map(|(key, source)| format!("{key} from {source}"))
+        .collect();
+    Some(format!("  inherited metadata: {}", parts.join(", ")))
 }
 
 /// Format a byte count like the TS CLI (`B`, `K`, `M`, `G`).

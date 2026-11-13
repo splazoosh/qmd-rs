@@ -957,10 +957,10 @@ fn metadata_by_filepath_skips_inactive_documents() {
     ];
     let found = store.metadata_by_filepath(&paths).unwrap();
     assert_eq!(
-        serde_json::to_string(&found["qmd://c/a.md"]).unwrap(),
+        serde_json::to_string(&found["qmd://c/a.md"].metadata).unwrap(),
         r#"{"status":"ok","n":3}"#
     );
-    assert!(found["qmd://c/b.md"].is_empty());
+    assert!(found["qmd://c/b.md"].metadata.is_empty());
     assert!(!found.contains_key("qmd://c/z.md"));
     store.deactivate_document("c", "a.md").unwrap();
     assert!(

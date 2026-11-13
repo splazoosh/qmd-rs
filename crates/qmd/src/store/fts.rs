@@ -301,7 +301,10 @@ impl Store {
             results
         };
         for r in &mut results {
-            r.context = self.context_for_file(&r.filepath)?;
+            r.context = self.context_for_file(
+                &r.collection_name,
+                super::relative_path(&r.filepath, &r.collection_name),
+            )?;
         }
         Ok(results)
     }

@@ -169,6 +169,28 @@ async fn a_non_loopback_address_is_refused() {
 }
 
 #[tokio::test]
+async fn rest_query_filters_on_inherited_metadata() {
+    let fixture = Fixture::with_inherited_metadata();
+    let (addr, _stop) = start(&fixture).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/query"))
+        .json(&json!({
+            "searches": [{ "type": "lex", "query": "quorum" }],
+            "filter": {"field": "area", "operator": "eq", "value": "elections"},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let rows = body["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    for row in rows {
+        assert_eq!(row["metadataSources"]["area"], "qmd://notes/meta/", "{row}");
+    }
+}
+
+#[tokio::test]
 async fn rest_routes_take_a_metadata_filter_and_report_metadata() {
     let fixture = Fixture::with_metadata();
     let (addr, _stop) = start(&fixture).await;

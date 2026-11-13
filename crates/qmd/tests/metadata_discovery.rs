@@ -182,11 +182,11 @@ fn two_paths_sharing_content_keep_their_own_metadata() {
         .metadata_by_filepath(&["qmd://c/a.md".to_owned(), "qmd://c/b.md".to_owned()])
         .unwrap();
     assert_eq!(
-        serde_json::to_value(&found["qmd://c/a.md"]).unwrap(),
+        serde_json::to_value(&found["qmd://c/a.md"].metadata).unwrap(),
         json!({"status": "published"})
     );
     assert_eq!(
-        serde_json::to_value(&found["qmd://c/b.md"]).unwrap(),
+        serde_json::to_value(&found["qmd://c/b.md"].metadata).unwrap(),
         json!({"status": "draft"})
     );
 }
@@ -205,7 +205,7 @@ fn status_of(store: &Store, path: &str) -> Option<Value> {
         .unwrap();
     found
         .get(&format!("qmd://t/{path}"))
-        .map(|m| serde_json::to_value(m).unwrap())
+        .map(|m| serde_json::to_value(&m.metadata).unwrap())
 }
 
 fn failed_paths(store: &Store) -> Vec<String> {

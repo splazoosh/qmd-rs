@@ -248,11 +248,7 @@ fn value_preview(summary: &MetadataKeySummary, drill_down_hint: &str) -> String 
             if only.distinct_values == only.documents {
                 return String::new();
             }
-            let mut preview: Vec<String> = only
-                .values
-                .iter()
-                .map(|v| format!("{} ({})", format_value(&v.value), count(v.documents)))
-                .collect();
+            let mut preview: Vec<String> = only.values.iter().map(value_with_count).collect();
             if only.remaining_values > 0 {
                 preview.push("...".to_owned());
             }
@@ -293,11 +289,17 @@ fn type_body(t: &MetadataKeyTypeSummary) -> Vec<String> {
             t.values
                 .iter()
                 .map(|v| {
-                    format!(
+                    let line = format!(
                         "  {}  {}",
                         pad_end(&format_value(&v.value), value_width),
                         pad_start(&count(v.documents), count_width)
-                    )
+                    );
+                    let inherited = inherited_text(v);
+                    if inherited.is_empty() {
+                        line
+                    } else {
+                        format!("{line}  {inherited}")
+                    }
                 })
                 .collect()
         }
@@ -325,11 +327,7 @@ fn type_split(types: &[MetadataKeyTypeSummary], options: &FormatOptions<'_>) -> 
                 ValueType::Boolean => boolean_counts(&t.values),
                 ValueType::Number => range_text(t),
                 ValueType::String => {
-                    let mut items: Vec<String> = t
-                        .values
-                        .iter()
-                        .map(|v| format!("{} ({})", format_value(&v.value), count(v.documents)))
-                        .collect();
+                    let mut items: Vec<String> = t.values.iter().map(value_with_count).collect();
                     if t.remaining_values > 0 {
                         items.push(format!("{} more", count(t.remaining_values)));
                     }
@@ -390,10 +388,32 @@ fn inline_values(t: &MetadataKeyTypeSummary) -> Vec<String> {
     if t.remaining_values == 0 {
         values.sort_by(|a, b| number_of(&a.value).total_cmp(&number_of(&b.value)));
     }
-    values
+    values.iter().map(|v| value_with_count(v)).collect()
+}
+
+/// `value (documents)`, with the inherited share when some inherit it:
+/// `draft (12; inherited 10 from qmd://notes/)`.
+fn value_with_count(v: &MetadataValueCount) -> String {
+    let inherited = inherited_text(v);
+    let sep = if inherited.is_empty() { "" } else { "; " };
+    format!(
+        "{} ({}{sep}{inherited})",
+        format_value(&v.value),
+        count(v.documents)
+    )
+}
+
+/// `inherited 10 from qmd://notes/, 2 from global`, or empty.
+fn inherited_text(v: &MetadataValueCount) -> String {
+    if v.inherited.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = v
+        .inherited
         .iter()
-        .map(|v| format!("{} ({})", format_value(&v.value), count(v.documents)))
-        .collect()
+        .map(|s| format!("{} from {}", count(s.documents), s.source))
+        .collect();
+    format!("inherited {}", parts.join(", "))
 }
 
 fn number_of(scalar: &Scalar) -> f64 {
@@ -406,11 +426,15 @@ fn number_of(scalar: &Scalar) -> f64 {
 fn boolean_counts(values: &[MetadataValueCount]) -> String {
     let find = |b: bool| values.iter().find(|v| v.value == Scalar::Boolean(b));
     let mut parts = Vec::new();
-    if let Some(v) = find(true) {
-        parts.push(format!("true {}", count(v.documents)));
-    }
-    if let Some(v) = find(false) {
-        parts.push(format!("false {}", count(v.documents)));
+    for b in [true, false] {
+        if let Some(v) = find(b) {
+            let inherited = inherited_text(v);
+            if inherited.is_empty() {
+                parts.push(format!("{b} {}", count(v.documents)));
+            } else {
+                parts.push(format!("{b} {} ({inherited})", count(v.documents)));
+            }
+        }
     }
     parts.join("  ")
 }
@@ -548,6 +572,7 @@ mod tests {
                 .map(|v| MetadataValueCount {
                     value: Scalar::String((*v).to_owned()),
                     documents: 1,
+                    inherited: Vec::new(),
                 })
                 .collect(),
             remaining_values: remaining,
@@ -580,6 +605,7 @@ mod tests {
             values: vec![MetadataValueCount {
                 value: Scalar::Number(7.0),
                 documents: 1,
+                inherited: Vec::new(),
             }],
             remaining_values: 0,
             range: Some(NumberRange {
@@ -679,10 +705,12 @@ mod tests {
                 MetadataValueCount {
                     value: Scalar::Number(1.5),
                     documents: 1,
+                    inherited: Vec::new(),
                 },
                 MetadataValueCount {
                     value: Scalar::Number(-2.0),
                     documents: 1,
+                    inherited: Vec::new(),
                 },
             ],
             remaining_values: 0,

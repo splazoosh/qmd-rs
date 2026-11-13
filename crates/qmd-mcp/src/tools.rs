@@ -166,9 +166,15 @@ pub struct QueryHit {
     /// `sectionLevel`); `line` and `snippet` then number the file's lines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<SectionHit>,
-    /// The document's indexed `qmd.metadata`, when it has any.
+    /// The document's indexed `qmd.metadata`, when it has any: its
+    /// frontmatter over what it inherits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// For each inherited key of `metadata`, the level it came from:
+    /// `global`, `qmd://<collection>/` or `qmd://<collection>/<prefix>/`.
+    /// Keys absent here are the file's own.
+    #[serde(rename = "metadataSources", skip_serializing_if = "Option::is_none")]
+    pub metadata_sources: Option<serde_json::Value>,
     /// The ranking trace, when `explain` asked for it: `contributions` (one
     /// per ranked list: `backend`, `kind`, `query`, `rank`, `weight`,
     /// `backend_score`, `rrf`), `rrf_base`, `rrf_bonus`, `rrf_score`,
@@ -304,16 +310,31 @@ pub fn query(index: &mut Index, params: &QueryParams) -> Result<(QueryOutput, St
         .iter()
         .map(|r| {
             let mut h = hit(r, &display_query, params.intent.as_deref());
-            h.metadata = metadata
-                .get(&r.filepath)
-                .filter(|m| !m.is_empty())
-                .map(|m| serde_json::to_value(m).expect("metadata serializes"));
+            if let Some(m) = metadata.get(&r.filepath) {
+                h.metadata = (!m.metadata.is_empty())
+                    .then(|| serde_json::to_value(&m.metadata).expect("metadata serializes"));
+                h.metadata_sources = (!m.sources.is_empty())
+                    .then(|| serde_json::to_value(&m.sources).expect("sources serialize"));
+            }
             h
         })
         .collect();
     let traces: Vec<Option<String>> = results
         .iter()
-        .map(|r| r.explain.as_ref().map(ToString::to_string))
+        .map(|r| {
+            r.explain.as_ref().map(|e| {
+                let mut trace = e.to_string();
+                if let Some(m) = metadata.get(&r.filepath).filter(|m| !m.sources.is_empty()) {
+                    let parts: Vec<String> = m
+                        .sources
+                        .iter()
+                        .map(|(key, source)| format!("{key} from {source}"))
+                        .collect();
+                    trace.push_str(&format!("\n  inherited metadata: {}", parts.join(", ")));
+                }
+                trace
+            })
+        })
         .collect();
     let summary = summarize(&hits, &traces, &display_query);
 
@@ -355,6 +376,7 @@ fn hit(r: &HybridResult, display_query: &str, intent: Option<&str>) -> QueryHit 
         line: snippet.line,
         snippet: snippet.numbered(),
         metadata: None,
+        metadata_sources: None,
         explain: r
             .explain
             .as_ref()

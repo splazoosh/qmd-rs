@@ -48,6 +48,14 @@ enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Declare qmd.metadata for every document under a path, as if each
+    /// file's frontmatter held it: the most specific level wins per key
+    /// (global, the collection, the longest prefix, then the file's own
+    /// frontmatter). Applied by the next `qmd update`; no file changes
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommand,
+    },
     /// Mirror one document with its provenance, or check one already held.
     /// Re-running against an archived URL compares rather than overwrites.
     Archive {
@@ -223,6 +231,33 @@ enum ContextCommand {
     /// List collections with no context, and the top-level directories of
     /// collections with some that none covers (not a TS qmd command)
     Check,
+}
+
+#[derive(Subcommand)]
+enum MetadataCommand {
+    /// Set keys for a path: `qmd metadata set PATH KEY=VALUE...`. PATH is
+    /// `/` for every collection, qmd://<collection>/ for one, or
+    /// qmd://<collection>/<prefix> or a directory inside a collection for a
+    /// folder. VALUE is YAML, as in frontmatter: draft, 3, true, [a, b]
+    Set {
+        /// `/`, qmd://<collection>/<path>, or a directory inside a collection
+        path: String,
+        /// KEY=VALUE pairs
+        #[arg(required = true, value_name = "KEY=VALUE")]
+        assignments: Vec<String>,
+    },
+    /// List every level's metadata
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove keys from a path's level, or the whole level when no key is
+    /// named
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// `/`, qmd://<collection>/<path>, or a directory inside a collection
+        path: String,
+        /// Keys to remove (default: all of them)
+        keys: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -462,6 +497,15 @@ fn main() {
             ContextCommand::Rm { path } => commands::context_remove(&location, &path),
             ContextCommand::Check => commands::context_check(&location),
         },
+        Command::Metadata { command } => match command {
+            MetadataCommand::Set { path, assignments } => {
+                commands::metadata_set(&location, &path, &assignments)
+            }
+            MetadataCommand::List => commands::metadata_list(&location),
+            MetadataCommand::Rm { path, keys } => {
+                commands::metadata_remove(&location, &path, &keys)
+            }
+        },
         Command::Cleanup { dry_run } => commands::cleanup(&location, dry_run),
         Command::Archive {
             command,
@@ -596,6 +640,7 @@ impl Command {
             Command::Context { command } => {
                 matches!(command, ContextCommand::List | ContextCommand::Check)
             }
+            Command::Metadata { command } => matches!(command, MetadataCommand::List),
             Command::Cleanup { dry_run } => *dry_run,
             Command::Archive { command, .. } => matches!(
                 command,

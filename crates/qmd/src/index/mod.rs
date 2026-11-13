@@ -87,6 +87,7 @@ fn sync_files(
     };
     let mut seen_paths: HashSet<String> = HashSet::with_capacity(total);
     let mut processed = 0usize;
+    let layers = store.inherited_layers(collection_name)?;
 
     for relative in files {
         processed += 1;
@@ -104,6 +105,7 @@ fn sync_files(
             continue;
         }
 
+        let inherited = layers.resolve(relative);
         let hash = crate::store::hash_content(&content);
         let title = crate::store::extract_title(&content, relative);
 
@@ -116,7 +118,9 @@ fn sync_files(
                         store.update_document_title(id, &title, &now)?;
                         result.updated += 1;
                     }
-                    store.sync_document_metadata(id, &content, relative, true)?
+                    store.sync_document_metadata_inheriting(
+                        id, &content, relative, true, &inherited,
+                    )?
                 } else {
                     store.insert_content(&hash, &content, &now)?;
                     let modified = system_time_iso(
@@ -125,7 +129,9 @@ fn sync_files(
                     );
                     store.update_document(id, &title, &hash, &modified)?;
                     result.updated += 1;
-                    store.sync_document_metadata(id, &content, relative, false)?
+                    store.sync_document_metadata_inheriting(
+                        id, &content, relative, false, &inherited,
+                    )?
                 }
             }
             None => {
@@ -155,9 +161,9 @@ fn sync_files(
                 )?;
                 result.indexed += 1;
                 match store.find_active_document(collection_name, relative)? {
-                    Some((id, _, _)) => {
-                        store.sync_document_metadata(id, &content, relative, false)?
-                    }
+                    Some((id, _, _)) => store.sync_document_metadata_inheriting(
+                        id, &content, relative, false, &inherited,
+                    )?,
                     None => None,
                 }
             }

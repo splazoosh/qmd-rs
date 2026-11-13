@@ -87,6 +87,32 @@ pub fn extract_document_metadata(content: &str, path: &str) -> ExtractionResult 
     }
 }
 
+/// Parse one value written as YAML (`draft`, `3`, `[a, b]`) under the rules
+/// frontmatter values follow, for metadata declared outside a file.
+///
+/// # Errors
+/// The message frontmatter extraction would give for the same value.
+pub fn parse_metadata_value(key: &str, yaml: &str) -> Result<MetadataValue, String> {
+    validate_key(key)?;
+    let value = parse_yaml(yaml)?;
+    normalize_value(key, &value)
+}
+
+/// Validate metadata declared as JSON-shaped values (a level of `index.yml`)
+/// under frontmatter's rules, limits included.
+///
+/// # Errors
+/// The message frontmatter extraction would give for the same mapping.
+pub fn normalize_metadata_json(
+    raw: &indexmap::IndexMap<String, serde_json::Value>,
+) -> Result<DocumentMetadata, String> {
+    let raw: Vec<(String, Yaml)> = raw
+        .iter()
+        .map(|(k, v)| (k.clone(), Yaml::from_json(v)))
+        .collect();
+    normalize(&raw)
+}
+
 /// The YAML between a leading `---` line and a closing `---` or `...` line.
 /// Tolerates a UTF-8 BOM and CRLF line endings; `None` without a complete
 /// leading block.
@@ -135,6 +161,25 @@ enum Yaml {
     String(String),
     Seq(Vec<Yaml>),
     Map(Vec<(String, Yaml)>),
+}
+
+impl Yaml {
+    fn from_json(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => Self::Number(n.as_f64().unwrap_or(f64::NAN)),
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(items) => {
+                Self::Seq(items.iter().map(Self::from_json).collect())
+            }
+            serde_json::Value::Object(map) => Self::Map(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from_json(v)))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 fn lookup<'a>(map: &'a [(String, Yaml)], key: &str) -> Option<&'a Yaml> {
@@ -304,13 +349,16 @@ fn normalize(raw: &[(String, Yaml)]) -> Result<DocumentMetadata, String> {
     let mut metadata = DocumentMetadata::with_capacity(raw.len());
     for (key, value) in raw {
         validate_key(key)?;
-        let value = match value {
-            Yaml::Seq(items) => MetadataValue::Array(normalize_array(key, items)?),
-            other => MetadataValue::Scalar(normalize_scalar(key, other)?),
-        };
-        metadata.insert(key.clone(), value);
+        metadata.insert(key.clone(), normalize_value(key, value)?);
     }
     Ok(metadata)
+}
+
+fn normalize_value(key: &str, value: &Yaml) -> Result<MetadataValue, String> {
+    Ok(match value {
+        Yaml::Seq(items) => MetadataValue::Array(normalize_array(key, items)?),
+        other => MetadataValue::Scalar(normalize_scalar(key, other)?),
+    })
 }
 
 fn validate_key(key: &str) -> Result<(), String> {

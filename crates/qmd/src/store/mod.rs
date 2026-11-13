@@ -3,7 +3,7 @@
 //! Mirrors the public surface of TS `store.ts` for the ported commands. The
 //! on-disk layout is byte-compatible with TS qmd v2.6.3.
 
-mod collections;
+pub(crate) mod collections;
 mod docs;
 mod fts;
 mod maintenance;
@@ -149,6 +149,16 @@ pub fn now_iso() -> String {
 /// Build a `qmd://collection/path` virtual path.
 pub fn build_virtual_path(collection: &str, path: &str) -> String {
     format!("qmd://{collection}/{path}")
+}
+
+/// The collection-relative path of `filepath`, the virtual path of a
+/// document in `collection`; empty when `filepath` is not under it.
+pub fn relative_path<'a>(filepath: &'a str, collection: &str) -> &'a str {
+    filepath
+        .strip_prefix("qmd://")
+        .and_then(|rest| rest.strip_prefix(collection))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or("")
 }
 
 /// Parse a `qmd://collection/path` virtual path into (collection, path).

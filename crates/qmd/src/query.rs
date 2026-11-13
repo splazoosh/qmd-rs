@@ -566,6 +566,7 @@ pub struct HybridResult {
     /// Virtual path `qmd://collection/path`.
     pub filepath: String,
     pub display_path: String,
+    pub collection_name: String,
     pub title: String,
     pub body: String,
     /// Best chunk text: the keyword-overlap chunk, or when reranked the
@@ -964,6 +965,7 @@ fn finalize_candidates(
             context: None,
             filepath: cand.filepath,
             display_path: cand.display_path,
+            collection_name: cand.collection_name,
             title: cand.title,
             body: cand.body,
             best_chunk,
@@ -1014,7 +1016,10 @@ fn finalize_candidates(
     }
 
     for result in &mut results {
-        result.context = store.context_for_file(&result.filepath)?;
+        result.context = store.context_for_file(
+            &result.collection_name,
+            crate::store::relative_path(&result.filepath, &result.collection_name),
+        )?;
     }
     Ok(results)
 }

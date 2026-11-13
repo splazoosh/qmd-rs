@@ -401,7 +401,10 @@ impl Store {
         for (row, distance) in hits {
             results.push(SearchResult {
                 docid: super::docs::docid(&row.hash),
-                context: self.context_for_file(&row.filepath)?,
+                context: self.context_for_file(
+                    &row.collection_name,
+                    super::relative_path(&row.filepath, &row.collection_name),
+                )?,
                 filepath: row.filepath,
                 display_path: row.display_path,
                 title: row.title,

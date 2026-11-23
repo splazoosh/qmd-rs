@@ -268,9 +268,7 @@ impl Store {
     }
 
     /// [`Store::search_fts_with`] restricted to documents a metadata
-    /// `filter` admits. A filtered search ranks the whole match set, not a
-    /// top-k window, so a matching document below stronger non-matching
-    /// ones is still found.
+    /// `filter` admits.
     pub fn search_fts_filtered(
         &self,
         query: &str,
@@ -279,21 +277,41 @@ impl Store {
         mode: TermMatch,
         filter: Option<&MetadataFilter>,
     ) -> Result<Vec<SearchResult>> {
+        let collections: Vec<String> = collection.map(str::to_owned).into_iter().collect();
+        self.search_fts_in(query, limit, &collections, mode, filter)
+    }
+
+    /// BM25 search over `collections` (empty searches every collection),
+    /// restricted to documents a metadata `filter` admits. A search
+    /// restricted either way ranks the whole match set, not a top-k window,
+    /// so a match below stronger ones outside the restriction is still
+    /// found.
+    pub fn search_fts_in(
+        &self,
+        query: &str,
+        limit: usize,
+        collections: &[String],
+        mode: TermMatch,
+        filter: Option<&MetadataFilter>,
+    ) -> Result<Vec<SearchResult>> {
         let Some(fts_query) = build_fts5_query_with(query, mode) else {
             return Ok(Vec::new());
         };
-        let scope = Scope { collection, filter };
+        let scope = Scope {
+            collections,
+            filter,
+        };
 
         let levels = self.section_levels()?;
         let mut results = if levels.is_empty() {
             self.search_documents_fts(&fts_query, limit, &scope, false)?
         } else {
-            let in_sections = |c: &str| levels.contains_key(c);
+            let in_sections = |c: &String| levels.contains_key(c.as_str());
             let mut results = Vec::new();
-            if collection.is_none_or(|c| !in_sections(c)) {
+            if collections.is_empty() || !collections.iter().all(in_sections) {
                 results = self.search_documents_fts(&fts_query, limit, &scope, true)?;
             }
-            if collection.is_none_or(in_sections) {
+            if collections.is_empty() || collections.iter().any(in_sections) {
                 results.extend(self.search_sections_fts(&fts_query, limit, &scope)?);
                 results.sort_by(|a, b| b.score.total_cmp(&a.score));
                 results.truncate(limit);
@@ -328,7 +346,7 @@ impl Store {
         }
         let fts_limit = scope.fts_limit(limit);
         let sql = format!(
-            "WITH fts_matches AS (
+            "WITH fts_matches AS MATERIALIZED (
                SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
                FROM documents_fts
                WHERE documents_fts MATCH ?1
@@ -375,9 +393,10 @@ impl Store {
     }
 }
 
-/// What a BM25 search is restricted to: one collection, a metadata filter.
+/// What a BM25 search is restricted to: a set of collections (empty is
+/// every collection), a metadata filter.
 pub(crate) struct Scope<'a> {
-    pub collection: Option<&'a str>,
+    pub collections: &'a [String],
     pub filter: Option<&'a MetadataFilter>,
 }
 
@@ -387,9 +406,9 @@ impl Scope<'_> {
     pub fn where_sql(&self, fts_query: &str) -> (String, Vec<SqlValue>) {
         let mut sql = String::new();
         let mut params = vec![SqlValue::Text(fts_query.to_owned())];
-        if let Some(c) = self.collection {
-            sql.push_str(" AND d.collection = ?2");
-            params.push(SqlValue::Text(c.to_owned()));
+        if !self.collections.is_empty() {
+            sql.push_str(" AND d.collection IN (SELECT value FROM json_each(?2))");
+            params.push(super::metadata::collections_json(self.collections));
         }
         if let Some(filter) = self.filter {
             let compiled = super::metadata::search_filter_sql(filter);
@@ -399,14 +418,16 @@ impl Scope<'_> {
         (sql, params)
     }
 
-    /// The candidate window of the FTS CTE. A collection scope fetches extra
-    /// candidates, since some will be dropped; a metadata filter ranks the
-    /// whole match set, so the filter, not the window, decides what is left.
+    /// The candidate window of the FTS CTE: `limit` rows when nothing
+    /// restricts the search, since the top of the index is then the answer.
+    /// A collection or a metadata filter ranks the whole match set, so a
+    /// match in scope is found however many stronger ones lie outside it.
+    /// The CTE is `MATERIALIZED` so that FTS5 still runs before the
+    /// restriction when no window forces that order (the query-planner
+    /// hazard the TS implementation documents).
     pub fn fts_limit(&self, limit: usize) -> String {
-        if self.filter.is_some() {
+        if self.filter.is_some() || !self.collections.is_empty() {
             String::new()
-        } else if self.collection.is_some() {
-            format!("LIMIT {}", limit.saturating_mul(10))
         } else {
             format!("LIMIT {limit}")
         }
@@ -416,6 +437,52 @@ impl Scope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collection_scope_ranks_the_whole_match_set() {
+        let store = Store::open_in_memory().unwrap();
+        let add = |collection: &str, path: &str, body: &str| {
+            let hash = crate::store::hash_content(body);
+            store.insert_content(&hash, body, "t").unwrap();
+            store
+                .insert_document(collection, path, "Doc", &hash, "t", "t")
+                .unwrap();
+        };
+        let limit = 5;
+        for i in 0..limit * 10 + 10 {
+            add(
+                "big",
+                &format!("{i}.md"),
+                &format!("quorum quorum quorum {i}"),
+            );
+        }
+        let filler = "Ordinary prose about unrelated matters goes on here. ".repeat(40);
+        add("small", "one.md", &format!("{filler}Mentions quorum once."));
+
+        let hits = store
+            .search_fts_with("quorum", limit, Some("small"), TermMatch::Any)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].display_path, "small/one.md");
+
+        add(
+            "other",
+            "two.md",
+            &format!("{filler}Quorum, mentioned once."),
+        );
+        let set = ["small".to_owned(), "other".to_owned()];
+        let hits = store
+            .search_fts_in("quorum", limit, &set, TermMatch::Any, None)
+            .unwrap();
+        let mut found: Vec<&str> = hits.iter().map(|h| h.display_path.as_str()).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["other/two.md", "small/one.md"]);
+
+        let unscoped = store
+            .search_fts_with("quorum", limit, None, TermMatch::Any)
+            .unwrap();
+        assert!(unscoped.iter().all(|h| h.collection_name == "big"));
+    }
 
     #[test]
     fn plain_terms_are_prefix_matched_and_anded() {

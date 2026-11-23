@@ -1429,8 +1429,8 @@ fn result_metadata<T>(
     Ok(app.store.metadata_by_filepath(&paths)?)
 }
 
-/// Drop results outside the selected collections (multi-collection filters
-/// run post-hoc; single-collection filters run at the SQL level).
+/// Drop vector results outside the selected collections (several collections
+/// filter post-hoc; one filters at the SQL level).
 fn retain_collections<T>(results: &mut Vec<T>, names: &[String], filepath: impl Fn(&T) -> &str) {
     if names.len() > 1 {
         let prefixes: Vec<String> = names.iter().map(|n| format!("qmd://{n}/")).collect();
@@ -1441,7 +1441,6 @@ fn retain_collections<T>(results: &mut Vec<T>, names: &[String], filepath: impl 
 pub fn search(location: &IndexLocation, query: &str, opts: &SearchOptions) -> Result<()> {
     let app = open(location)?;
     let collection_names = resolve_collection_filter(&app, &opts.collections)?;
-    let single_collection = (collection_names.len() == 1).then(|| collection_names[0].clone());
 
     let limit = opts.limit.unwrap_or_else(|| opts.format.default_limit());
     let limit = if opts.all { 100_000 } else { limit };
@@ -1455,14 +1454,13 @@ pub fn search(location: &IndexLocation, query: &str, opts: &SearchOptions) -> Re
     if filter.is_some() {
         warn_pending_metadata(&app, &collection_names)?;
     }
-    let mut results = app.store.search_fts_filtered(
+    let mut results = app.store.search_fts_in(
         query,
         fetch_limit,
-        single_collection.as_deref(),
+        &collection_names,
         term_match,
         filter.as_ref(),
     )?;
-    retain_collections(&mut results, &collection_names, |r| &r.filepath);
 
     let min_score = opts.min_score.unwrap_or(0.0);
     results.retain(|r| r.score >= min_score);

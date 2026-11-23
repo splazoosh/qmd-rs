@@ -8,7 +8,7 @@
 //! may quote.
 //!
 //! They describe *this* pipeline, not the TypeScript one: there is no query
-//! expansion and no rerank here, so nothing claims them.
+//! expansion here, so nothing claims it.
 
 use anyhow::Result;
 
@@ -94,8 +94,21 @@ pub fn build(index: &Index) -> Result<String> {
             .to_owned(),
     );
 
+    lines.push(
+        "  Pass `filter` to keep only documents whose `qmd.metadata` satisfies it. A \
+         condition on a key sees only documents that declare that key, `ne` and `nin` \
+         included, so every other document drops out; only `exists: false` or a `not` \
+         reaches them. Call `metadata` first: each key's `N of M documents` is \
+         how much of the scope the filter can see."
+            .to_owned(),
+    );
+
     lines.push(String::new());
-    lines.push("Read what you find:".to_owned());
+    lines.push(
+        "Read what you find. A snippet is a lead, not a source: fetch the document \
+         before stating a fact, decision or quote from it."
+            .to_owned(),
+    );
     lines.push(
         "  - `get` — one document, by the `file` path or the `#docid` from a result. \
          Accepts a line-range suffix: `repo/doc.md:100` from line 100, `repo/doc.md:100:40` \

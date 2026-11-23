@@ -107,6 +107,29 @@ async fn instructions_name_the_collections_that_are_in_the_index() {
 }
 
 #[tokio::test]
+async fn instructions_say_to_fetch_before_claiming_and_check_coverage_before_filtering() {
+    let fixture = Fixture::with_metadata();
+    let (client, instructions) = connect(&fixture).await;
+
+    assert!(
+        instructions.contains("A snippet is a lead, not a source"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("only `exists: false` or a `not` reaches them"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Call `metadata` first: each key's `N of M documents`"),
+        "{instructions}"
+    );
+    let text = text_of(&call(&client, "metadata", json!({})).await);
+    assert!(text.contains("2 of 5 documents"), "{text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn query_returns_ranked_rows_as_structured_content() {
     let fixture = Fixture::build();
     let (client, _) = connect(&fixture).await;

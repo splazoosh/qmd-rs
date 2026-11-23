@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.1
+
+- A keyword search scoped to collections (`search -c`, and the keyword half
+  of `query`, in the CLI, MCP and REST) ranks every match in the scope. It
+  used to rank the strongest matches of all collections first, ten times the
+  number asked for, and scope afterwards, so a scope's match was lost when
+  that many stronger ones lay outside it.
+- The MCP instructions say to fetch a document before stating facts from a
+  result's snippet, and to read a key's coverage with `metadata` before
+  filtering on it, since a condition on a key sees only the documents that
+  declare it, unless it is `exists: false` or under a `not`.
+
 ## 0.7.0
 
 - Inherited metadata: `qmd metadata set <path> key=value...`, `list` and `rm`

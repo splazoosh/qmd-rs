@@ -287,7 +287,7 @@ impl Store {
         let fts_limit = scope.fts_limit(limit);
         let (collection_filter, params) = scope.where_sql(fts_query);
         let sql = format!(
-            "WITH fts_matches AS (
+            "WITH fts_matches AS MATERIALIZED (
                SELECT rowid, bm25(sections_fts, 1.5, 4.0, 1.0) as bm25_score
                FROM sections_fts
                WHERE sections_fts MATCH ?1
@@ -476,6 +476,70 @@ mod tests {
         );
         let quorum = hits[0].section.as_ref().unwrap();
         assert_eq!(&doc[quorum.start..quorum.end], hits[0].body);
+    }
+
+    #[test]
+    fn a_collection_scope_ranks_every_matching_section() {
+        let store = Store::open_in_memory().unwrap();
+        let limit = 5;
+        for i in 0..limit * 10 + 10 {
+            let body = format!("## Quorum {i}\n\nquorum quorum quorum {i}\n");
+            add(&store, "big", &format!("{i}.md"), &body);
+        }
+        let filler = "Ordinary prose about unrelated matters goes on here. ".repeat(40);
+        let body = format!("## Notes\n\n{filler}Mentions quorum once.\n");
+        add(&store, "small", "one.md", &body);
+        set_level(&store, "big", Some(2));
+        set_level(&store, "small", Some(2));
+
+        let hits = store
+            .search_fts_with("quorum", limit, Some("small"), crate::store::TermMatch::Any)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].collection_name, "small");
+        assert!(hits[0].section.is_some());
+    }
+
+    #[test]
+    fn a_scope_over_section_and_file_collections_ranks_both_tables() {
+        let store = Store::open_in_memory().unwrap();
+        let limit = 5;
+        for i in 0..limit * 10 + 10 {
+            let body = format!("## Quorum {i}\n\nquorum quorum quorum {i}\n");
+            add(&store, "big", &format!("{i}.md"), &body);
+            add(&store, "bigfile", &format!("{i}.md"), &body);
+        }
+        let filler = "Ordinary prose about unrelated matters goes on here. ".repeat(40);
+        let body = format!("## Notes\n\n{filler}Mentions quorum once.\n");
+        add(&store, "sec", "one.md", &body);
+        add(&store, "file", "two.md", &body);
+        set_level(&store, "big", Some(2));
+        set_level(&store, "sec", Some(2));
+
+        let search = |set: &[&str], limit| {
+            let set: Vec<String> = set.iter().map(|&c| c.to_owned()).collect();
+            store
+                .search_fts_in("quorum", limit, &set, crate::store::TermMatch::Any, None)
+                .unwrap()
+        };
+        let mut found: Vec<(String, bool)> = search(&["sec", "file", "absent"], limit)
+            .into_iter()
+            .map(|h| (h.display_path, h.section.is_some()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("file/two.md".to_owned(), false),
+                ("sec/one.md".to_owned(), true)
+            ]
+        );
+
+        let all = search(&["big", "bigfile", "sec", "file"], 1000);
+        assert_eq!(all.len(), 122);
+        let top = search(&["big", "bigfile", "sec", "file"], limit);
+        let scores = |hits: &[SearchResult]| hits.iter().map(|h| h.score).collect::<Vec<_>>();
+        assert_eq!(scores(&top), scores(&all[..limit]));
     }
 
     #[test]

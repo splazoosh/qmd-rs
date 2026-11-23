@@ -106,7 +106,7 @@ pub(crate) fn search_filter_sql(filter: &MetadataFilter) -> CompiledSql {
 }
 
 /// A collection scope bound as one JSON parameter, so no variable limit applies.
-fn collections_json(collections: &[String]) -> SqlValue {
+pub(super) fn collections_json(collections: &[String]) -> SqlValue {
     SqlValue::Text(serde_json::to_string(collections).expect("names serialize"))
 }
 

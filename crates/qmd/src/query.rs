@@ -523,15 +523,16 @@ pub enum RerankChunk {
     BestOfNearest(usize),
 }
 
-/// One ranked list of up to [`PER_LIST_LIMIT`] hits restricted to
+/// One ranked vector list of up to [`PER_LIST_LIMIT`] hits restricted to
 /// `collections` (empty = all). `fetch(k, collection)` is a store search.
+/// BM25 lists need none of this: [`Store::search_fts_in`] scopes in SQL.
 ///
 /// One collection filters in SQL. Several take one wide unfiltered pass,
 /// which usually holds enough hits from the set; when it does not, each
-/// collection is searched and the hits merged by score (BM25 and vector
-/// scores are absolute, so they compare across collections). Filtering only
-/// the fused top `limit` instead can leave nothing, however many matches the
-/// set holds.
+/// collection is searched and the hits merged by score (vector scores are
+/// absolute, so they compare across collections). Filtering only the fused
+/// top `limit` instead can leave nothing, however many matches the set
+/// holds.
 fn ranked_list(
     collections: &[String],
     fetch: impl Fn(usize, Option<&str>) -> Result<Vec<SearchResult>>,
@@ -642,9 +643,13 @@ pub fn hybrid_query(
     let collections = &options.collections;
     let mut report = HybridReport::default();
 
-    let initial_fts = ranked_list(collections, |k, c| {
-        store.search_fts_filtered(query, k, c, options.term_match, options.filter.as_ref())
-    })?;
+    let initial_fts = store.search_fts_in(
+        query,
+        PER_LIST_LIMIT,
+        collections,
+        options.term_match,
+        options.filter.as_ref(),
+    )?;
     let top_score = initial_fts.first().map_or(0.0, |r| r.score);
     let second_score = initial_fts.get(1).map_or(0.0, |r| r.score);
     if options.intent.is_none()
@@ -750,15 +755,13 @@ pub fn structured_search(
 
     for search in searches {
         if search.query_type == QueryType::Lex {
-            let fts_results = ranked_list(collections, |k, c| {
-                store.search_fts_filtered(
-                    &search.query,
-                    k,
-                    c,
-                    options.term_match,
-                    options.filter.as_ref(),
-                )
-            })?;
+            let fts_results = store.search_fts_in(
+                &search.query,
+                PER_LIST_LIMIT,
+                collections,
+                options.term_match,
+                options.filter.as_ref(),
+            )?;
             if !fts_results.is_empty() {
                 lists.push(fts_results);
                 sources.push(typed(Backend::Fts, search));

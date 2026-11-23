@@ -6,7 +6,7 @@
 //! would. Model-free: the embedder factory returns qmd's deterministic
 //! `MockEmbedder`.
 
-mod common;
+use crate::common;
 
 use common::Fixture;
 use qmd_mcp::QmdServer;

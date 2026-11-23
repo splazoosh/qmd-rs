@@ -44,7 +44,7 @@ impl IndexLocation {
         }
     }
 
-    fn db_path(&self) -> Result<PathBuf> {
+    pub(crate) fn db_path(&self) -> Result<PathBuf> {
         if let Some(path) = std::env::var_os("INDEX_PATH") {
             return Ok(PathBuf::from(path));
         }

@@ -492,6 +492,38 @@ impl Archive {
             .ok_or(Error::NotArchived(key.url))
     }
 
+    /// Remove the item for `url` whole: every revision, its manifest and its
+    /// fetch log. Per-host state (`hosts.json`, cached `robots.txt`) is not
+    /// the item's and stays. The host directory goes too once nothing is left
+    /// in it.
+    ///
+    /// Returns the removed item's path relative to the root, which is the
+    /// prefix its extracts carry in an index of the archive.
+    ///
+    /// # Errors
+    /// [`Error::NotArchived`] when nothing is held for `url`; an I/O error
+    /// when the directory cannot be removed, in which case running it again
+    /// finishes the job, since a directory left without its manifest still
+    /// counts as held here.
+    pub fn remove(&self, url: &str) -> Result<String> {
+        let key = ItemKey::parse(url)?;
+        let _lock = self.lock()?;
+        let dir = self.item_dir(&key);
+        if !dir.is_dir() {
+            return Err(Error::NotArchived(key.url));
+        }
+        std::fs::remove_dir_all(&dir).map_err(|source| Error::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        if let Some(host) = dir.parent()
+            && std::fs::read_dir(host).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            let _ = std::fs::remove_dir(host);
+        }
+        Ok(key.dir_name())
+    }
+
     /// The fetch log for one URL, oldest first.
     pub fn history(&self, url: &str) -> Result<Vec<FetchRecord>> {
         let key = ItemKey::parse(url)?;

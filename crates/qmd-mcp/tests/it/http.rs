@@ -2,7 +2,7 @@
 //! without the protocol, and the DNS-rebinding guard refuses a foreign `Host`
 //! or `Origin`. Model-free, over a real socket on a free loopback port.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 

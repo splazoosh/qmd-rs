@@ -2,7 +2,7 @@
 //! stdin/stdout and exits cleanly when the client closes stdin.
 //!
 //! The in-process surface tests live in `qmd-mcp`
-//! (`crates/qmd-mcp/tests/surface.rs`); what only the binary can show is that
+//! (`crates/qmd-mcp/tests/it/surface.rs`); what only the binary can show is that
 //! the stdio transport is wired and that EOF terminates the process — the
 //! behaviour TS needed `registerStdioEofShutdown` to get.
 //!

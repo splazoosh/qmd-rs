@@ -6,12 +6,12 @@
 //! `#[ignore]`d so plain `cargo test` stays model-free. Run with:
 //!
 //! ```text
-//! cargo test --release --test eval_hybrid -- --ignored --nocapture
+//! cargo test --release --test it -- --ignored --nocapture eval_hybrid::
 //! ```
 
 #![cfg(feature = "llama")]
 
-mod common;
+use crate::common;
 
 use common::{EvalQuery, by_difficulty, indexed_store};
 use qmd::Store;
@@ -20,10 +20,6 @@ use qmd::embed::{
 };
 use qmd::models::DEFAULT_EMBED_MODEL;
 use qmd::query::{HybridOptions, hybrid_query};
-
-/// Serializes model tests within this binary: two concurrent llama contexts
-/// in one process produce corrupted embeddings (observed as wrong eval hits).
-static MODEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn embedded_store() -> (Store, LlamaEmbedder) {
     let store = indexed_store();
@@ -61,7 +57,7 @@ fn hit_rate(store: &Store, embedder: &LlamaEmbedder, queries: &[&EvalQuery], top
 #[test]
 #[ignore = "requires the real embedding model (run locally)"]
 fn hybrid_eval_gates() {
-    let _guard = MODEL_LOCK.lock().unwrap();
+    let _guard = common::model_lock();
     let (store, embedder) = embedded_store();
 
     let easy = hit_rate(&store, &embedder, &by_difficulty("easy"), 3);
@@ -89,7 +85,7 @@ fn hybrid_eval_gates() {
 #[test]
 #[ignore = "requires the real embedding model (run locally)"]
 fn hybrid_eval_fusion_gates() {
-    let _guard = MODEL_LOCK.lock().unwrap();
+    let _guard = common::model_lock();
     let (store, embedder) = embedded_store();
     let fusion = by_difficulty("fusion");
 

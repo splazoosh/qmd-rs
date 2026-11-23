@@ -8,8 +8,8 @@
 
 use qmd_archive::extract::{HTML_TEXT, Rules, extract};
 
-const A: &[u8] = include_bytes!("../fixtures/rotating-a.html");
-const B: &[u8] = include_bytes!("../fixtures/rotating-b.html");
+const A: &[u8] = include_bytes!("../../fixtures/rotating-a.html");
+const B: &[u8] = include_bytes!("../../fixtures/rotating-b.html");
 const HTML: Option<&str> = Some("text/html; charset=utf-8");
 
 #[test]

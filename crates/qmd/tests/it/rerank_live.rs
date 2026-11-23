@@ -4,12 +4,12 @@
 //! first use); `#[ignore]`d so plain `cargo test` stays model-free:
 //!
 //! ```text
-//! cargo test --release --test rerank_live -- --ignored --nocapture
+//! cargo test --release --test it -- --ignored --nocapture rerank_live::
 //! ```
 
 #![cfg(feature = "llama")]
 
-mod common;
+use crate::common;
 
 use qmd::models::DEFAULT_RERANK_MODEL;
 use qmd::rerank::{LlamaReranker, Reranker as _};
@@ -17,6 +17,7 @@ use qmd::rerank::{LlamaReranker, Reranker as _};
 #[test]
 #[ignore = "requires the rerank model"]
 fn reranker_scores_the_answering_passage_highest() {
+    let _guard = common::model_lock();
     let reranker = LlamaReranker::load(DEFAULT_RERANK_MODEL).expect("load rerank model");
     let read = |name: &str| std::fs::read_to_string(common::eval_docs_dir().join(name)).unwrap();
     let docs = vec![

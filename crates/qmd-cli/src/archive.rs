@@ -296,6 +296,47 @@ pub fn verify(url: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Remove one item whole, and its extracts from this index if the archive is
+/// indexed in it. Per-host state stays. Purging the index directly, rather
+/// than leaving it to `update` and `cleanup`, keeps the extract from being
+/// searchable in between and touches nothing else inactive.
+pub fn remove(url: &str, location: &IndexLocation) -> Result<()> {
+    let archive = open();
+    let relative = archive.remove(url)?;
+    let c = colors();
+    println!(
+        "{}✓ removed {url} from {}{}",
+        c.green,
+        archive.root().display(),
+        c.reset
+    );
+
+    let config = qmd::config::load_config(&location.config_path())?;
+    let indexed = config.get(COLLECTION).is_some_and(|existing| {
+        std::fs::canonicalize(&existing.path).ok() == std::fs::canonicalize(archive.root()).ok()
+    });
+    if !indexed {
+        return Ok(());
+    }
+    let db_path = location.db_path()?;
+    let store = qmd::Store::open(&db_path)
+        .with_context(|| format!("failed to open index at {}", db_path.display()))?;
+    let purged = store
+        .purge_documents_under(COLLECTION, &relative)
+        .with_context(|| {
+            format!(
+                "the item is gone from disk but its extracts are still in {}; \
+                 'qmd update' then 'qmd cleanup' removes them",
+                db_path.display()
+            )
+        })?;
+    println!(
+        "  {purged} extract(s) removed from collection '{COLLECTION}' in {}",
+        db_path.display()
+    );
+    Ok(())
+}
+
 /// Register the archive as an ordinary collection, so its extracts are
 /// searchable through the query path that already exists. Running it again
 /// is harmless: an `archive` collection already over this root is reported,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+
+- `qmd archive rm <url>` removes an archived item whole, its revisions and
+  fetch history included, and deletes its extracts from the index when that
+  index holds the archive collection. Per-host request spacing and the cached
+  `robots.txt` stay.
+
 ## 0.7.1
 
 - A keyword search scoped to collections (`search -c`, and the keyword half

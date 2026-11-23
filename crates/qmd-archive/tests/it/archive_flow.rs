@@ -434,6 +434,46 @@ fn every_archived_item_is_listed_with_its_manifest() {
 }
 
 #[test]
+fn removing_an_item_takes_all_of_it_and_leaves_per_host_state() {
+    let f = fixture();
+    let other = "https://example.org/book/appendix.html";
+    f.fetcher
+        .push_ok(URL, "text/html; charset=utf-8", &page("aaaa", "0.0134"));
+    let report = f
+        .archive
+        .archive(&f.fetcher, URL, &ArchiveOptions::default(), at(10))
+        .unwrap();
+    f.fetcher
+        .push_ok(other, "text/html; charset=utf-8", &page("bbbb", "0.0201"));
+    f.archive
+        .archive(&f.fetcher, other, &ArchiveOptions::default(), at(20))
+        .unwrap();
+    let root = f.archive.root();
+    let robots = root.join("hosts").join(HOST).join("robots.txt");
+    let hosts = root.join("hosts.json");
+    assert!(robots.is_file() && hosts.is_file());
+
+    let removed = f.archive.remove(URL).unwrap();
+
+    assert_eq!(root.join(&removed), report.dir);
+    assert!(!report.dir.exists());
+    assert!(matches!(f.archive.get(URL), Err(Error::NotArchived(_))));
+    assert!(matches!(f.archive.history(URL), Err(Error::NotArchived(_))));
+    let items = f.archive.items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1.url, other);
+    assert!(robots.is_file() && hosts.is_file());
+
+    f.archive.remove(other).unwrap();
+    assert!(
+        !root.join(HOST).exists(),
+        "an emptied host directory goes too"
+    );
+    assert!(robots.is_file() && hosts.is_file());
+    assert!(matches!(f.archive.remove(URL), Err(Error::NotArchived(_))));
+}
+
+#[test]
 fn a_revision_from_a_retired_extractor_version_is_unverifiable_not_mismatched() {
     let f = fixture();
     f.fetcher

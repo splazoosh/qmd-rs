@@ -1,7 +1,7 @@
 //! End-to-end hybrid `query` pipeline with the deterministic mock embedder —
 //! no model downloads (the TS `CI=true` analogue).
 
-mod common;
+use crate::common;
 
 use qmd::embed::{EmbedOptions, MockEmbedder, generate_embeddings};
 use qmd::query::{

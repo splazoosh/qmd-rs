@@ -124,3 +124,11 @@ pub fn indexed_store() -> Store {
     }
     store
 }
+
+/// Serializes the tests that load a llama model: two concurrent llama contexts
+/// in one process produce corrupted embeddings (observed as wrong eval hits).
+pub fn model_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

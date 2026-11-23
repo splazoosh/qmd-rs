@@ -1,4 +1,4 @@
-//! The fixture index both test binaries serve.
+//! The fixture index the suite serves.
 
 use std::path::Path;
 

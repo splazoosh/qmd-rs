@@ -207,6 +207,12 @@ enum ArchiveCommand {
     },
     /// Register the archive as a collection so its extracts are searchable
     Index,
+    /// Remove one item whole, its fetch history included, and its extracts
+    /// from this index. Per-host spacing and robots.txt stay
+    Rm {
+        /// The archived URL
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -517,9 +523,10 @@ fn main() {
             (Some(ArchiveCommand::Show { url }), _) => archive::show(&url),
             (Some(ArchiveCommand::Verify { url }), _) => archive::verify(url.as_deref()),
             (Some(ArchiveCommand::Index), _) => archive::index(&location),
+            (Some(ArchiveCommand::Rm { url }), _) => archive::remove(&url, &location),
             (None, Some(url)) => archive::add(&url, update, &drop),
             (None, None) => Err(anyhow::anyhow!(
-                "give a URL to archive, or one of: list, show, verify, index"
+                "give a URL to archive, or one of: list, show, verify, index, rm"
             )),
         },
         Command::Update => commands::update(&location),

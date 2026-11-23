@@ -1,7 +1,7 @@
 //! End-to-end embed + vsearch flow with the deterministic mock embedder —
 //! no model downloads (the TS `CI=true` analogue).
 
-mod common;
+use crate::common;
 
 use qmd::embed::{
     EmbedOptions, EmbedStop, Embedder as _, MockEmbedder, embedding_fingerprint,
@@ -192,6 +192,66 @@ fn cleanup_removes_orphaned_vectors_and_leaves_nothing_to_re_embed() {
     assert_eq!(
         again.docs_processed, 0,
         "the active documents keep their vectors"
+    );
+}
+
+#[test]
+fn purging_a_prefix_removes_its_documents_and_only_what_they_alone_used() {
+    let store = common::indexed_store();
+    let now = qmd::store::now_iso();
+    let add = |path: &str, body: &str| {
+        let hash = qmd::store::hash_content(body);
+        store.insert_content(&hash, body, &now).unwrap();
+        store
+            .insert_document("archive", path, "t", &hash, &now, &now)
+            .unwrap();
+    };
+    let gone = "Zygomorphic quillwort survey notes.";
+    let shared = "Quillwort shared revision text.";
+    add("example.org/survey-aaaa1111/v1/extract.md", gone);
+    add("example.org/survey-aaaa1111/v2/extract.md", shared);
+    add("example.org/survey-aaaa11112/v1/extract.md", shared);
+    let mock = MockEmbedder::default();
+    generate_embeddings(&store, &mock, &EmbedOptions::default()).unwrap();
+    let count = |sql: &str| -> i64 { store.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    let vectors_before = count("SELECT COUNT(*) FROM vectors_vec");
+
+    let removed = store
+        .purge_documents_under("archive", "example.org/survey-aaaa1111")
+        .unwrap();
+
+    assert_eq!(removed, 2);
+    assert!(
+        store
+            .search_fts("zygomorphic", 10, None)
+            .unwrap()
+            .is_empty()
+    );
+    let kept = store.search_fts("quillwort", 10, None).unwrap();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].filepath.ends_with("survey-aaaa11112/v1/extract.md"));
+    let hash = qmd::store::hash_content(gone);
+    let held = |table: &str| -> i64 {
+        store
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE hash = ?1"),
+                [&hash],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(held("content") + held("content_vectors"), 0);
+    assert!(count("SELECT COUNT(*) FROM vectors_vec") < vectors_before);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM vectors_vec"),
+        count("SELECT COUNT(*) FROM content_vectors"),
+        "vec0 rows and their records leave together"
+    );
+    assert_eq!(
+        store.preview_cleanup().unwrap().orphaned_content,
+        0,
+        "nothing is left for cleanup"
     );
 }
 

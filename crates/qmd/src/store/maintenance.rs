@@ -75,6 +75,63 @@ impl Store {
         })
     }
 
+    /// Delete every document of `collection` at `prefix` or under `prefix/`,
+    /// active or not, with what only those documents used: their content,
+    /// embedded chunks and section rows. The FTS rows go with the documents
+    /// by trigger. Another document holding the same content keeps it. Returns
+    /// the documents removed.
+    ///
+    /// For removing a source from disk and the index together, where waiting
+    /// for `update` to mark it inactive and `cleanup` to purge it would leave
+    /// it searchable in between and purge everything else inactive with it.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures; nothing is removed when one occurs.
+    pub fn purge_documents_under(&self, collection: &str, prefix: &str) -> Result<usize> {
+        let prefix = prefix.trim_end_matches('/');
+        let tx = self.conn().unchecked_transaction()?;
+        let hashes: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT hash FROM documents WHERE collection = ?1
+                   AND (path = ?2 OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+            )?;
+            let rows = stmt.query_map(params![collection, prefix], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let removed = tx.execute(
+            "DELETE FROM documents WHERE collection = ?1
+               AND (path = ?2 OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+            params![collection, prefix],
+        )?;
+        let vec_table = self.vec_table_exists()?;
+        for hash in &hashes {
+            let held: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM documents WHERE hash = ?1)",
+                params![hash],
+                |r| r.get(0),
+            )?;
+            if held {
+                continue;
+            }
+            if vec_table {
+                let seqs: Vec<i64> = {
+                    let mut stmt = tx.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
+                    let rows = stmt.query_map(params![hash], |r| r.get(0))?;
+                    rows.collect::<std::result::Result<_, _>>()?
+                };
+                let mut del = tx.prepare("DELETE FROM vectors_vec WHERE hash_seq = ?1")?;
+                for seq in seqs {
+                    del.execute(params![format!("{hash}_{seq}")])?;
+                }
+            }
+            tx.execute("DELETE FROM content_vectors WHERE hash = ?1", params![hash])?;
+            tx.execute("DELETE FROM content WHERE hash = ?1", params![hash])?;
+        }
+        self.sync_sections(Some(collection))?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Delete the embedded chunks of content no active document holds: what
     /// an edited document's old hash leaves behind. `embed` runs this, so
     /// orphans do not build up between cleanups. Returns the chunks removed.

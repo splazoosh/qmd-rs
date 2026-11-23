@@ -3,7 +3,7 @@
 //! Indexes the 6-document eval corpus in `fixtures/eval-docs` and checks
 //! Hit@k rates against the TS baselines.
 
-mod common;
+use crate::common;
 
 use common::{EvalQuery, by_difficulty, indexed_store};
 use qmd::Store;

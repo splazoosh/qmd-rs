@@ -8,7 +8,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,12 +20,6 @@ use crate::commands::IndexLocation;
 
 /// How long `--daemon` waits for the child to answer before giving up.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a daemon handing over stays up to deliver its last reply.
-const REPLY_FLUSH: Duration = Duration::from_millis(300);
-
-/// How long a replacement waits for the port.
-const HANDOVER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The PID and log file of the daemon serving one index.
 pub struct DaemonFiles {
@@ -66,8 +60,8 @@ pub struct Running {
 }
 
 /// The daemon for this index, if one is answering. A PID file nobody answers
-/// for is removed, unless a start or a handover holding the [`StartLock`] is
-/// still waiting for its server to bind, or the file changed while it was asked.
+/// for is removed, unless a start holding the [`StartLock`] is still waiting
+/// for its server to bind, or the file changed while it was asked.
 pub fn running(files: &DaemonFiles) -> Option<Running> {
     let text = fs::read_to_string(&files.pid).ok()?;
     let recorded: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -91,7 +85,7 @@ pub fn running(files: &DaemonFiles) -> Option<Running> {
     None
 }
 
-/// Whether a `start` or a handover is in progress for this index.
+/// Whether a `start` is in progress for this index.
 fn starting(files: &DaemonFiles) -> bool {
     is_fresh(&StartLock::path(files))
 }
@@ -117,20 +111,15 @@ fn remove_if_names(files: &DaemonFiles, pid: u32) {
     }
 }
 
-/// Held for the length of one `start` or handover, so nothing else acts on the
-/// PID file while it changes hands. A lock older than [`START_TIMEOUT`] is a
-/// crashed holder's.
+/// Held for the length of one `start`, so nothing else acts on the PID file
+/// while it is written. A lock older than [`START_TIMEOUT`] is a crashed
+/// holder's.
 #[must_use = "dropping a StartLock releases it"]
 pub struct StartLock(PathBuf);
 
 impl StartLock {
     fn path(files: &DaemonFiles) -> PathBuf {
         files.pid.with_extension("starting")
-    }
-
-    /// The lock the daemon being replaced took for this process to release.
-    pub fn handed_over(location: &IndexLocation) -> Self {
-        Self(Self::path(&DaemonFiles::for_index(location)))
     }
 
     fn acquire(files: &DaemonFiles) -> Result<Self> {
@@ -185,7 +174,6 @@ pub fn start(location: &IndexLocation, port: u16) -> Result<()> {
 
     let exe = std::env::current_exe().context("failed to locate the qmd binary")?;
     let mut command = server_command(&exe, location, port, log)?;
-    command.arg("--daemon-child");
     let mut child = spawn_detached(&mut command)?;
     let pid = child.id();
     fs::write(&files.pid, json!({ "pid": pid, "port": port }).to_string())
@@ -234,77 +222,11 @@ fn server_command(exe: &Path, location: &IndexLocation, port: u16, log: File) ->
     Ok(command)
 }
 
-/// Replace this daemon with a new process on the same port, and end this one.
-/// The replacement waits for the port, records itself in the PID file, and
-/// releases the [`StartLock`] taken here; the log is appended to, so the failure
-/// that caused this stays readable.
-///
-/// A hard stop, as `qmd mcp stop` is: an orderly exit would run the CUDA
-/// runtime's teardown in the state that made this necessary.
-///
-/// # Errors
-/// Fails if the [`StartLock`] is taken, the config does not load, the replacement
-/// cannot be started, or it exits while this process waits, leaving this process
-/// running: degraded still answers lexical queries.
-pub fn relaunch(location: &IndexLocation, port: u16) -> Result<()> {
-    let files = DaemonFiles::for_index(location);
-    let lock = StartLock::acquire(&files)?;
-    qmd::config::load_config(&location.config_path())?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&files.log)
-        .with_context(|| format!("failed to open {}", files.log.display()))?;
-    let exe = std::env::current_exe().context("failed to locate the qmd binary")?;
-    let mut command = server_command(&exe, location, port, log)?;
-    command.arg("--replacement");
-    let mut child = spawn_detached(&mut command)?;
-    eprintln!("qmd: handing over to PID {}", child.id());
-    std::thread::sleep(REPLY_FLUSH);
-    if let Some(status) = child.try_wait()? {
-        bail!(
-            "the replacement exited ({status}); see {}",
-            files.log.display()
-        );
-    }
-    std::mem::forget(lock);
-    kill(std::process::id())
-}
-
-/// Wait for the server being replaced to give up `port`.
-///
-/// # Errors
-/// Fails if the port is still taken after [`HANDOVER_TIMEOUT`].
-pub fn await_port(port: u16) -> Result<()> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let deadline = Instant::now() + HANDOVER_TIMEOUT;
-    loop {
-        match TcpListener::bind(addr) {
-            Ok(_) => return Ok(()),
-            Err(e) if Instant::now() > deadline => {
-                return Err(e).with_context(|| format!("port {port} was not released"));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-}
-
-/// Record this process as the daemon for `location`.
-///
-/// # Errors
-/// Fails if the PID file cannot be written.
-pub fn record(location: &IndexLocation, port: u16) -> Result<()> {
-    let files = DaemonFiles::for_index(location);
-    let pid = std::process::id();
-    fs::write(&files.pid, json!({ "pid": pid, "port": port }).to_string())
-        .with_context(|| format!("failed to write {}", files.pid.display()))
-}
-
 /// Stop the daemon for this index, if one is answering.
 ///
 /// # Errors
-/// Refuses during a start or a handover, and fails if the daemon cannot be killed
-/// or still answers afterwards.
+/// Refuses during a start, and fails if the daemon cannot be killed or still
+/// answers afterwards.
 pub fn stop(location: &IndexLocation) -> Result<()> {
     let files = DaemonFiles::for_index(location);
     if starting(&files) {
@@ -329,9 +251,7 @@ pub fn stop(location: &IndexLocation) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if !starting(&files) {
-        remove_if_names(&files, r.pid);
-    }
+    remove_if_names(&files, r.pid);
     println!("Stopped the QMD MCP server (PID {}).", r.pid);
     Ok(())
 }
@@ -472,6 +392,7 @@ fn kill(pid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead as _, BufReader};
+    use std::net::TcpListener;
 
     use super::*;
 
@@ -543,27 +464,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_leaves_the_record_of_a_replacement_it_did_not_stop() {
+    fn a_stop_leaves_the_record_of_a_daemon_started_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
         let location = IndexLocation::Local(dir.path().join("index.yml"));
         let pid_file = DaemonFiles::for_index(&location).pid;
-        let replacement = json!({ "pid": u32::MAX, "port": 1 }).to_string();
+        let next = json!({ "pid": u32::MAX, "port": 1 }).to_string();
 
-        let (path, record) = (pid_file.clone(), replacement.clone());
+        let (path, record) = (pid_file.clone(), next.clone());
         stop_a_stand_in(&location, move || fs::write(path, record).unwrap());
 
-        assert_eq!(fs::read_to_string(&pid_file).unwrap(), replacement);
-    }
-
-    #[test]
-    fn a_stop_leaves_the_record_while_a_handover_holds_the_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let location = IndexLocation::Local(dir.path().join("index.yml"));
-        let files = DaemonFiles::for_index(&location);
-
-        let lock = StartLock::path(&files);
-        stop_a_stand_in(&location, move || fs::write(lock, "").unwrap());
-
-        assert!(files.pid.exists());
+        assert_eq!(fs::read_to_string(&pid_file).unwrap(), next);
     }
 }

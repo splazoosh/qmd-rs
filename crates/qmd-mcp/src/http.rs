@@ -143,6 +143,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": if failure.is_some() { "degraded" } else { "ok" },
         "embedder": embedder.label(),
         "embedderError": failure,
+        "models": if embedder.models_loaded() { "loaded" } else { "unloaded" },
         "pid": std::process::id(),
         "uptime": state.started.elapsed().as_secs(),
         "version": env!("CARGO_PKG_VERSION"),

@@ -116,7 +116,8 @@ impl Collection {
     }
 }
 
-/// Per-role model URI overrides (`models:` section of `index.yml`).
+/// Per-role model URIs and how the models are run (`models:` section of
+/// `index.yml`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +126,17 @@ pub struct ModelsConfig {
     pub generate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<String>,
+    /// Where the models run ([`crate::models::resolve_gpu_mode`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<crate::models::GpuMode>,
+    /// Seconds a server keeps unused models loaded; 0 keeps them
+    /// ([`crate::models::resolve_idle_unload`]).
+    #[serde(
+        default,
+        rename = "idleSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idle_seconds: Option<u64>,
 }
 
 /// Search defaults (`search:` section of `index.yml`); a CLI flag or MCP

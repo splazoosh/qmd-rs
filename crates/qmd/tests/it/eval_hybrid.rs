@@ -23,7 +23,8 @@ use qmd::query::{HybridOptions, hybrid_query};
 
 fn embedded_store() -> (Store, LlamaEmbedder) {
     let store = indexed_store();
-    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL).expect("load embed model");
+    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL, qmd::models::GpuMode::Auto)
+        .expect("load embed model");
     let result = generate_embeddings(&store, &embedder, &EmbedOptions::default()).unwrap();
     assert_eq!(result.docs_processed, 6);
     assert_eq!(result.errors, 0, "failures: {:?}", result.failures);

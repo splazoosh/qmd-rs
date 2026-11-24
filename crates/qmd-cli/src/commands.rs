@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use qmd::config::{self, CollectionConfig};
 use qmd::index::reindex_collection;
+use qmd::models::GpuMode;
 use qmd::store::{DocumentLookup, Store, default_db_path};
 
 use crate::SearchOptions;
@@ -170,10 +171,13 @@ pub fn status(location: &IndexLocation) -> Result<()> {
     if let Some(size) = index_size {
         println!("Size:   {}", format_bytes(size));
     }
-    match embed_on_gpu()? {
-        Some(true) => println!("Embed:  GPU"),
-        Some(false) => println!("Embed:  {}CPU — {CPU_EMBED_WARNING}{}", c.yellow, c.reset),
-        None => {}
+    let mode = gpu_mode(&app.config)?;
+    match embed_on_gpu(mode) {
+        Ok(Some(true)) => println!("Embed:  GPU"),
+        Ok(Some(false)) if mode == GpuMode::Off => println!("Embed:  CPU (GPU mode off)"),
+        Ok(Some(false)) => println!("Embed:  {}CPU — {CPU_EMBED_WARNING}{}", c.yellow, c.reset),
+        Ok(None) => {}
+        Err(e) => println!("Embed:  {}unavailable — {e:#}{}", c.yellow, c.reset),
     }
     if let Some(r) = crate::daemon::running(&crate::daemon::DaemonFiles::for_index(location)) {
         match &r.embedder_error {
@@ -1493,16 +1497,81 @@ fn embed_model(config: &CollectionConfig) -> String {
     qmd::models::resolve_embed_model(config.models.as_ref())
 }
 
-/// The mock `QMD_MOCK_EMBEDDER` selects; `fail-after-N` makes it fail once it
-/// has embedded N batches.
-fn mock_embedder() -> qmd::embed::MockEmbedder {
-    std::env::var("QMD_MOCK_EMBEDDER")
-        .ok()
-        .and_then(|v| v.strip_prefix("fail-after-")?.parse().ok())
-        .map_or_else(
-            qmd::embed::MockEmbedder::default,
-            qmd::embed::MockEmbedder::failing_after,
-        )
+/// The GPU mode this index's models run under.
+fn gpu_mode(config: &CollectionConfig) -> Result<GpuMode> {
+    Ok(qmd::models::resolve_gpu_mode(config.models.as_ref())?)
+}
+
+/// What `QMD_MOCK_EMBEDDER` asks of the mock beyond embedding. Each fault
+/// stands in for a way a GPU is lost.
+enum MockFault {
+    None,
+    /// `fail-after-N`: every batch after the first N fails.
+    FailAfter(usize),
+    /// `abort-after-N`: the process aborts on the batch after the first N, as
+    /// ggml does when a `cudaFree` fails.
+    AbortAfter(usize),
+    /// `fail-on-gpu`: the model loads only under GPU mode `off`.
+    FailOnGpu,
+}
+
+fn mock_fault() -> MockFault {
+    let value = std::env::var("QMD_MOCK_EMBEDDER").unwrap_or_default();
+    let count = |prefix: &str| value.strip_prefix(prefix)?.parse().ok();
+    if let Some(batches) = count("fail-after-") {
+        MockFault::FailAfter(batches)
+    } else if let Some(batches) = count("abort-after-") {
+        MockFault::AbortAfter(batches)
+    } else if value == "fail-on-gpu" {
+        MockFault::FailOnGpu
+    } else {
+        MockFault::None
+    }
+}
+
+/// The mock `QMD_MOCK_EMBEDDER` selects, loaded under `mode`.
+fn mock_embedder(mode: GpuMode) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
+    use qmd::embed::MockEmbedder;
+    Ok(match mock_fault() {
+        MockFault::None => Box::new(MockEmbedder::default()),
+        MockFault::FailAfter(batches) => Box::new(MockEmbedder::failing_after(batches)),
+        MockFault::AbortAfter(batches) => Box::new(AbortingMock {
+            inner: MockEmbedder::default(),
+            batches_left: std::cell::Cell::new(batches),
+        }),
+        MockFault::FailOnGpu if mode == GpuMode::Off => Box::new(MockEmbedder::default()),
+        MockFault::FailOnGpu => bail!("mock GPU fault"),
+    })
+}
+
+/// The mock embedder, ending its process on the batch after `batches_left`.
+struct AbortingMock {
+    inner: qmd::embed::MockEmbedder,
+    batches_left: std::cell::Cell<usize>,
+}
+
+impl qmd::embed::Embedder for AbortingMock {
+    fn model_uri(&self) -> &str {
+        self.inner.model_uri()
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> qmd::Result<Vec<Option<Vec<f32>>>> {
+        match self.batches_left.get() {
+            0 => std::process::abort(),
+            left => self.batches_left.set(left - 1),
+        }
+        self.inner.embed_batch(texts)
+    }
+}
+
+impl qmd::chunk::Tokenizer for AbortingMock {
+    fn count_tokens(&self, text: &str) -> qmd::Result<usize> {
+        self.inner.count_tokens(text)
+    }
+
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> qmd::Result<String> {
+        self.inner.truncate_to_tokens(text, max_tokens)
+    }
 }
 
 /// Whether `QMD_MOCK_EMBEDDER` selects the deterministic mock backend
@@ -1515,11 +1584,12 @@ fn mock_embedder_requested() -> bool {
 }
 
 #[cfg(feature = "llama")]
-fn load_embedder(model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
+fn load_embedder(model: &str, mode: GpuMode) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
     if mock_embedder_requested() {
-        return Ok(Box::new(mock_embedder()));
+        return mock_embedder(mode);
     }
-    let embedder = qmd::embed::LlamaEmbedder::load(model).with_context(|| {
+    qmd::embed::gpu_offload(mode)?;
+    let embedder = qmd::embed::LlamaEmbedder::load(model, mode).with_context(|| {
         format!(
             "failed to load embedding model {model} — \
              run 'qmd pull' to (re)download it"
@@ -1530,38 +1600,39 @@ fn load_embedder(model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
 
 /// Load the reranker for a model URI. `QMD_MOCK_EMBEDDER` selects the mock
 /// reranker too, so the test seam needs no model.
-fn load_reranker(model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
+fn load_reranker(model: &str, mode: GpuMode) -> Result<Box<dyn qmd::rerank::Reranker>> {
     if mock_embedder_requested() {
         return Ok(Box::new(qmd::rerank::MockReranker));
     }
-    load_llama_reranker(model)
+    load_llama_reranker(model, mode)
 }
 
 #[cfg(feature = "llama")]
-fn load_llama_reranker(model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
-    let reranker = qmd::rerank::LlamaReranker::load(model).with_context(|| {
+fn load_llama_reranker(model: &str, mode: GpuMode) -> Result<Box<dyn qmd::rerank::Reranker>> {
+    qmd::embed::gpu_offload(mode)?;
+    let reranker = qmd::rerank::LlamaReranker::load(model, mode).with_context(|| {
         format!("failed to load rerank model {model} — run 'qmd pull' to (re)download it")
     })?;
     Ok(Box::new(reranker))
 }
 
 #[cfg(not(feature = "llama"))]
-fn load_llama_reranker(_model: &str) -> Result<Box<dyn qmd::rerank::Reranker>> {
+fn load_llama_reranker(_model: &str, _mode: GpuMode) -> Result<Box<dyn qmd::rerank::Reranker>> {
     bail!("this build has no model backend: rebuild qmd-cli with its default features to rerank")
 }
 
-/// Where `load_embedder` will run: `Some(true)` GPU, `Some(false)` CPU, `None`
-/// for the mock embedder or a build with no embedding backend.
+/// Where `load_embedder` will run under `mode`: `Some(true)` GPU, `Some(false)`
+/// CPU, `None` for the mock embedder or a build with no embedding backend.
 #[cfg(feature = "llama")]
-fn embed_on_gpu() -> Result<Option<bool>> {
+fn embed_on_gpu(mode: GpuMode) -> Result<Option<bool>> {
     if mock_embedder_requested() {
         return Ok(None);
     }
-    Ok(Some(qmd::embed::gpu_offload()?))
+    Ok(Some(qmd::embed::gpu_offload(mode)?))
 }
 
 #[cfg(not(feature = "llama"))]
-fn embed_on_gpu() -> Result<Option<bool>> {
+fn embed_on_gpu(_mode: GpuMode) -> Result<Option<bool>> {
     Ok(None)
 }
 
@@ -1572,9 +1643,9 @@ const CPU_EMBED_WARNING: &str = "this qmd has no GPU offload and embeds on the C
      usable CUDA device); rebuild with plain 'cargo build --release'";
 
 #[cfg(not(feature = "llama"))]
-fn load_embedder(_model: &str) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
+fn load_embedder(_model: &str, mode: GpuMode) -> Result<Box<dyn qmd::embed::EmbeddingBackend>> {
     if mock_embedder_requested() {
-        return Ok(Box::new(mock_embedder()));
+        return mock_embedder(mode);
     }
     bail!(
         "this build has no embedding backend: rebuild qmd-cli with its default \
@@ -1602,7 +1673,7 @@ pub fn vsearch(location: &IndexLocation, query: &str, opts: &SearchOptions) -> R
     }
 
     let model = embed_model(&app.config);
-    let embedder = load_embedder(&model)?;
+    let embedder = load_embedder(&model, gpu_mode(&app.config)?)?;
     let formatted = format_query_for_embedding(query, &model);
     let embedding = embedder
         .embed(&formatted)?
@@ -1670,16 +1741,17 @@ pub fn query(
     let embedder: Option<Box<dyn qmd::embed::EmbeddingBackend>> =
         if needs_embedder && (cfg!(feature = "llama") || mock_embedder_requested()) {
             let model = embed_model(&app.config);
-            Some(load_embedder(&model)?)
+            Some(load_embedder(&model, gpu_mode(&app.config)?)?)
         } else {
             None
         };
     let embedder_dyn = embedder.as_deref().map(|e| e as &dyn qmd::embed::Embedder);
     let settings = app.config.search_settings();
     let reranker = if rerank.or(settings.rerank).unwrap_or(false) {
-        Some(load_reranker(&qmd::models::resolve_rerank_model(
-            app.config.models.as_ref(),
-        ))?)
+        Some(load_reranker(
+            &qmd::models::resolve_rerank_model(app.config.models.as_ref()),
+            gpu_mode(&app.config)?,
+        )?)
     } else {
         None
     };
@@ -1822,10 +1894,11 @@ pub fn embed(
     let model = embed_model(&app.config);
     let c = colors();
     println!("{}Generating embeddings{} ({model})", c.bold, c.reset);
-    if embed_on_gpu()? == Some(false) {
+    let mode = gpu_mode(&app.config)?;
+    if mode != GpuMode::Off && embed_on_gpu(mode)? == Some(false) {
         eprintln!("{}warning:{} {CPU_EMBED_WARNING}", c.yellow, c.reset);
     }
-    let embedder = load_embedder(&model)?;
+    let embedder = load_embedder(&model, mode)?;
 
     let options = EmbedOptions {
         force,
@@ -2014,32 +2087,95 @@ fn parse_line_suffix(input: &str) -> Option<(String, usize, Option<usize>)> {
     Some((rest.to_owned(), line, None))
 }
 
-/// The model loaders the MCP index thread calls on first use.
-fn factories(relaunch: Option<qmd_mcp::Relaunch>) -> qmd_mcp::Factories {
-    qmd_mcp::Factories {
-        embedder: Box::new(load_embedder),
-        reranker: Box::new(load_reranker),
-        relaunch,
+/// Fetch `model` in this process, where a failed download is the query's to
+/// report, before a host is asked to load it.
+fn model_ready(model: &str) -> Result<()> {
+    if mock_embedder_requested() {
+        return Ok(());
+    }
+    #[cfg(feature = "llama")]
+    {
+        qmd::models::ensure_model(model).with_context(|| {
+            format!("failed to fetch model {model} — run 'qmd pull' to (re)download it")
+        })?;
+        Ok(())
+    }
+    #[cfg(not(feature = "llama"))]
+    {
+        bail!(
+            "this build has no model backend for {model}: rebuild qmd-cli with its default \
+             features to use vector search and rerank"
+        )
     }
 }
 
-/// How `qmd mcp` was started: by hand, or as the daemon.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum McpRole {
-    Foreground,
-    Daemon,
-    /// The daemon, taking over from a process that lost its embedder.
-    Replacement,
+/// A file's size and modification time: a rename keeps both, a new build does
+/// not.
+type Stamp = (u64, std::time::SystemTime);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// The binary a server runs its model host from: its own, so that both ends
+/// are one version. The server was started from `exe`, whose stamp was then
+/// `own`; install.ps1 moves a running binary aside as `exe`.old and puts the
+/// next build at `exe`, where servers it does not restart would find it.
+fn host_binary(exe: &Path, own: Option<Stamp>) -> PathBuf {
+    let aside = exe.with_added_extension("old");
+    let is_own = |path: &Path| own.is_some() && stamp(path) == own;
+    if !is_own(exe) && is_own(&aside) {
+        aside
+    } else {
+        exe.to_owned()
+    }
+}
+
+/// The model loaders the MCP index thread calls on first use. A server's
+/// models live in one `qmd model-host` child and never in the server
+/// (`qmd::host` says why).
+fn factories() -> Result<qmd_mcp::Factories> {
+    let exe = std::env::current_exe().context("failed to locate the qmd binary")?;
+    let own = stamp(&exe);
+    let host = qmd::host::HostClient::new(move |mode| {
+        let mut command = std::process::Command::new(host_binary(&exe, own));
+        command.args(["model-host", "--gpu", mode.as_str()]);
+        command
+    });
+    let rerank_host = host.clone();
+    let running_host = host.clone();
+    Ok(qmd_mcp::Factories {
+        embedder: Box::new(move |model, mode| {
+            model_ready(model)?;
+            Ok(Box::new(host.embedder(model, mode)))
+        }),
+        reranker: Box::new(move |model, mode| {
+            model_ready(model)?;
+            Ok(Box::new(rerank_host.reranker(model, mode)))
+        }),
+        in_memory: Box::new(move || running_host.is_running()),
+    })
+}
+
+/// `qmd model-host`: hold the models of the server that started this process,
+/// under `mode`, and answer it until it closes stdin.
+pub fn model_host(mode: GpuMode) -> Result<()> {
+    let text = |e: anyhow::Error| format!("{e:#}");
+    let loaders = qmd::host::Loaders {
+        embedder: Box::new(move |model| load_embedder(model, mode).map_err(text)),
+        reranker: Box::new(move |model| load_reranker(model, mode).map_err(text)),
+    };
+    qmd::host::serve(std::io::stdin().lock(), std::io::stdout().lock(), &loaders)
+        .context("the model host lost its server")
 }
 
 /// `qmd mcp`: serve the active index over MCP on stdin/stdout, or with
 /// `http_port` over HTTP on that loopback port until interrupted.
 ///
-/// The CLI supplies the embedder factory so the `llama` feature and its native
+/// The CLI supplies the model loaders so the `llama` feature and its native
 /// build stay on this side of the seam; `qmd-mcp` never links llama.cpp.
-pub fn mcp(location: &IndexLocation, http_port: Option<u16>, role: McpRole) -> Result<()> {
-    let handover =
-        (role == McpRole::Replacement).then(|| crate::daemon::StartLock::handed_over(location));
+pub fn mcp(location: &IndexLocation, http_port: Option<u16>) -> Result<()> {
     let config_path = location.config_path();
     let db_path = location.db_path()?;
     let config = config::load_config(&config_path)?;
@@ -2054,31 +2190,16 @@ pub fn mcp(location: &IndexLocation, http_port: Option<u16>, role: McpRole) -> R
             &config_path,
             &db_path,
             model,
-            factories(None),
+            factories()?,
         ));
     };
-    if role == McpRole::Replacement {
-        crate::daemon::await_port(port)?;
-    }
-    let relaunch: Option<qmd_mcp::Relaunch> = (role != McpRole::Foreground).then(|| {
-        let location = location.clone();
-        Box::new(move || crate::daemon::relaunch(&location, port)) as qmd_mcp::Relaunch
-    });
     let served = runtime.block_on(qmd_mcp::serve_http(
         &config_path,
         &db_path,
         model,
-        factories(relaunch),
+        factories()?,
         std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-        move |addr| {
-            eprintln!("QMD MCP server listening on http://{addr}/mcp");
-            if role == McpRole::Replacement
-                && let Err(e) = crate::daemon::record(location, port)
-            {
-                eprintln!("qmd: {e:#}");
-            }
-            drop(handover);
-        },
+        |addr| eprintln!("QMD MCP server listening on http://{addr}/mcp"),
         async {
             let _ = tokio::signal::ctrl_c().await;
         },
@@ -2142,4 +2263,34 @@ pub fn ls(location: &IndexLocation, path: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_runs_its_host_from_its_own_binary_through_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("qmd.exe");
+        let aside = dir.path().join("qmd.exe.old");
+        std::fs::write(&exe, "this build").unwrap();
+        let own = stamp(&exe);
+        assert_eq!(host_binary(&exe, own), exe);
+
+        std::fs::rename(&exe, &aside).unwrap();
+        assert_eq!(host_binary(&exe, own), aside);
+
+        std::fs::write(&exe, "the next build").unwrap();
+        assert_eq!(host_binary(&exe, own), aside);
+        assert_eq!(
+            host_binary(&exe, stamp(&exe)),
+            exe,
+            "a server started since"
+        );
+
+        let since = stamp(&exe);
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(host_binary(&exe, since), exe);
+    }
 }

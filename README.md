@@ -77,6 +77,14 @@ otherwise qmd fetches the file itself, sending your Hugging Face token
 (`HF_TOKEN`, or the file `hf auth login` writes) when one is set. `qmd status`
 shows which.
 
+Models run on the GPU when the build has one (`auto`). `QMD_LLAMA_GPU`, or
+`models.gpu` in `index.yml`, chooses `cuda`, `vulkan`, `metal` or `off`
+instead; `off` opens no GPU device. A `qmd mcp` server keeps its models in a
+child process and ends it after five minutes without a query that needs them
+(`QMD_MODEL_IDLE_SECONDS` or `models.idleSeconds`; 0 keeps them), so an idle
+server holds no model memory, and a model process that fails is replaced
+without the server restarting.
+
 ## MCP
 
 `qmd mcp` serves the index to an agent over MCP on stdio, with the tools

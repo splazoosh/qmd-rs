@@ -21,7 +21,8 @@ use qmd::models::DEFAULT_EMBED_MODEL;
 
 fn embedded_store() -> (Store, LlamaEmbedder) {
     let store = indexed_store();
-    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL).expect("load embed model");
+    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL, qmd::models::GpuMode::Auto)
+        .expect("load embed model");
     let result = generate_embeddings(&store, &embedder, &EmbedOptions::default()).unwrap();
     assert_eq!(result.docs_processed, 6);
     assert_eq!(result.errors, 0, "failures: {:?}", result.failures);
@@ -74,7 +75,8 @@ fn vector_eval_gates() {
 #[ignore = "requires the real embedding model (run locally)"]
 fn embedding_sanity_cosines() {
     let _guard = common::model_lock();
-    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL).expect("load embed model");
+    let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL, qmd::models::GpuMode::Auto)
+        .expect("load embed model");
     let embed = |text: &str| embedder.embed(text).unwrap().unwrap();
     let cosine = |a: &[f32], b: &[f32]| {
         let dot: f64 = a
@@ -102,4 +104,28 @@ fn embedding_sanity_cosines() {
     println!("cos(doc, unrelated)  = {c_unrelated:.4}");
     assert!(c_para > c_query && c_query > c_unrelated);
     assert!(c_unrelated < 0.4);
+}
+
+/// `off` is the same model on another device: its embedding of a text agrees
+/// with the GPU's.
+#[test]
+#[ignore = "requires the real embedding model (run locally)"]
+fn the_cpu_and_the_gpu_embed_a_text_alike() {
+    use qmd::models::GpuMode;
+    let _guard = common::model_lock();
+    let text = "title: none | text: The quick brown fox jumps over the lazy dog.";
+    let embed = |mode| {
+        let embedder = LlamaEmbedder::load(DEFAULT_EMBED_MODEL, mode).expect("load embed model");
+        embedder.embed(text).unwrap().unwrap()
+    };
+    let (gpu, cpu) = (embed(GpuMode::Auto), embed(GpuMode::Off));
+    let dot = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum()
+    };
+    let cosine = dot(&gpu, &cpu) / (dot(&gpu, &gpu) * dot(&cpu, &cpu)).sqrt();
+    println!("cos(gpu, cpu) = {cosine:.6}");
+    assert!(cosine > 0.999, "cos(gpu, cpu) = {cosine}");
 }

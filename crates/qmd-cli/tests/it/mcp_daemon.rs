@@ -109,24 +109,26 @@ fn post_query(port: &str, body: &str) -> String {
     response
 }
 
-/// Index the project and start a daemon whose embedder fails after one batch.
-/// Returns its port and the PID file's text.
-fn start_failing_daemon(dir: &Path) -> (String, String) {
+/// Index the project and start a daemon with `env` set, `QMD_MOCK_EMBEDDER`
+/// among it. Returns its port and PID.
+fn start_daemon(dir: &Path, env: &[(&str, &str)]) -> (String, u32) {
     assert!(qmd(dir, &["update"]).status.success());
     assert!(qmd(dir, &["embed"]).status.success());
     let port = free_port().to_string();
     let started = Command::new(env!("CARGO_BIN_EXE_qmd"))
         .args(["mcp", "--http", "--daemon", "--port", &port])
         .current_dir(dir)
-        .env("QMD_MOCK_EMBEDDER", "fail-after-1")
         .env_remove("INDEX_PATH")
+        .env_remove("QMD_LLAMA_GPU")
+        .env_remove("QMD_MODEL_IDLE_SECONDS")
         .env("QMD_CONFIG_DIR", dir.join("config-unused"))
         .env("XDG_CACHE_HOME", dir.join("cache-unused"))
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     assert!(started.status.success());
-    let first = std::fs::read_to_string(dir.join(".qmd/mcp.pid")).unwrap();
-    (port, first)
+    let pid = pid_in(&std::fs::read_to_string(dir.join(".qmd/mcp.pid")).unwrap());
+    (port, pid)
 }
 
 /// The `"pid"` in a PID file or a `/health` body.
@@ -136,118 +138,159 @@ fn pid_in(json: &str) -> u32 {
     digits[..end].parse().unwrap()
 }
 
-/// Wait for a process other than the one `first` names to answer on `port`.
-fn await_replacement(port: &str, first: &str) -> u32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        if let Some(pid) = health(port).map(|h| pid_in(&h))
-            && pid != pid_in(first)
-        {
-            return pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no replacement answered"
-        );
+fn log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(".qmd/mcp.log")).unwrap()
+}
+
+/// The PIDs of the model hosts the daemon's log says it started, in order.
+fn host_pids(dir: &Path) -> Vec<u32> {
+    log(dir)
+        .lines()
+        .filter_map(|line| {
+            line.split_once("model host started (PID ")?
+                .1
+                .split_once(',')?
+                .0
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+fn is_running(pid: u32) -> bool {
+    if cfg!(windows) {
+        let filter = format!("PID eq {pid}");
+        let out = Command::new("tasklist")
+            .args(["/NH", "/FI", &filter])
+            .output()
+            .unwrap();
+        stdout(&out).contains(&pid.to_string())
+    } else {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+}
+
+/// Wait up to ten seconds for `done`.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
+const QUERY: &str = r#"{"query":"leaders"}"#;
+
 #[test]
-fn a_daemon_that_loses_its_embedder_hands_over_to_a_new_process() {
+fn a_daemon_whose_model_host_starts_failing_answers_from_a_new_one() {
     let tmp = project();
     let dir = tmp.path();
     let _cleanup = scopeguard(dir);
-    let (port, first) = start_failing_daemon(dir);
-    let pid_file = dir.join(".qmd/mcp.pid");
+    let (port, pid) = start_daemon(dir, &[("QMD_MOCK_EMBEDDER", "fail-after-1")]);
 
-    let query = r#"{"query":"leaders"}"#;
-    let worked = post_query(&port, query);
-    assert!(worked.starts_with("HTTP/1.1 200"), "{worked}");
-    let failed = post_query(&port, query);
-    assert!(failed.contains("retry in a few seconds"), "{failed}");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let moved = std::fs::read_to_string(&pid_file).is_ok_and(|now| now != first);
-        if moved && health(&port).is_some_and(|h| h.contains(r#""status":"ok""#)) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no replacement answered"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..3 {
+        let answered = post_query(&port, QUERY);
+        assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
     }
-    let recovered = post_query(&port, query);
-    assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
-    let log = std::fs::read_to_string(dir.join(".qmd/mcp.log")).unwrap();
-    assert!(log.contains("mock embedder fault"), "{log}");
 
-    let stopped = qmd(dir, &["mcp", "stop"]);
-    assert!(stdout(&stopped).contains("Stopped"), "{}", stdout(&stopped));
-    assert!(health(&port).is_none());
+    let health = health(&port).unwrap();
+    assert_eq!(pid_in(&health), pid);
+    assert!(health.contains(r#""status":"ok""#), "{health}");
+    assert!(log(dir).contains("mock embedder fault"), "{}", log(dir));
+    assert_eq!(host_pids(dir).len(), 3);
 }
 
 #[test]
-fn a_status_during_the_handover_leaves_the_replacement_findable() {
+fn a_daemon_whose_model_host_dies_answers_from_a_new_one() {
     let tmp = project();
     let dir = tmp.path();
     let _cleanup = scopeguard(dir);
-    let (port, first) = start_failing_daemon(dir);
-    let query = r#"{"query":"leaders"}"#;
-    assert!(post_query(&port, query).starts_with("HTTP/1.1 200"));
+    let (port, pid) = start_daemon(dir, &[("QMD_MOCK_EMBEDDER", "abort-after-1")]);
 
-    let started = std::time::Instant::now();
-    let replacement = std::thread::scope(|scope| {
-        for _ in 0..3 {
-            scope.spawn(|| {
-                while started.elapsed() < std::time::Duration::from_secs(4) {
-                    qmd(dir, &["status"]);
-                }
-            });
-        }
-        post_query(&port, query);
-        await_replacement(&port, &first)
+    assert!(post_query(&port, QUERY).starts_with("HTTP/1.1 200"));
+    let answered = post_query(&port, QUERY);
+    assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
+
+    assert_eq!(pid_in(&health(&port).unwrap()), pid);
+    assert!(log(dir).contains("the model host stopped"), "{}", log(dir));
+}
+
+#[test]
+fn under_auto_a_gpu_no_new_host_can_use_gives_way_to_the_cpu() {
+    let tmp = project();
+    let dir = tmp.path();
+    let _cleanup = scopeguard(dir);
+    let (port, _) = start_daemon(dir, &[("QMD_MOCK_EMBEDDER", "fail-on-gpu")]);
+
+    let answered = post_query(&port, QUERY);
+
+    assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
+    assert!(log(dir).contains("GPU mode off"), "{}", log(dir));
+}
+
+#[test]
+fn under_a_named_gpu_mode_the_loss_is_reported_and_lexical_search_goes_on() {
+    let tmp = project();
+    let dir = tmp.path();
+    let _cleanup = scopeguard(dir);
+    let env = [
+        ("QMD_MOCK_EMBEDDER", "fail-on-gpu"),
+        ("QMD_LLAMA_GPU", "cuda"),
+    ];
+    let (port, pid) = start_daemon(dir, &env);
+
+    let failed = post_query(&port, QUERY);
+    assert!(failed.contains("mock GPU fault"), "{failed}");
+    eventually("no host is left, so no model is loaded", || {
+        health(&port).is_some_and(|h| h.contains(r#""models":"unloaded""#))
     });
+    let health = health(&port).unwrap();
+    assert!(health.contains(r#""status":"degraded""#), "{health}");
+    assert_eq!(pid_in(&health), pid);
 
-    let recorded = std::fs::read_to_string(dir.join(".qmd/mcp.pid")).unwrap_or_default();
-    assert!(recorded.contains(&replacement.to_string()), "{recorded:?}");
-}
-
-#[test]
-fn a_stop_during_the_handover_is_refused_rather_than_undone() {
-    let tmp = project();
-    let dir = tmp.path();
-    let _cleanup = scopeguard(dir);
-    let (port, first) = start_failing_daemon(dir);
-    let query = r#"{"query":"leaders"}"#;
-    assert!(post_query(&port, query).starts_with("HTTP/1.1 200"));
-    post_query(&port, query);
-
-    let stop = qmd(dir, &["mcp", "stop"]);
-
-    assert!(!stop.status.success(), "{}", stdout(&stop));
-    await_replacement(&port, &first);
-    assert!(stdout(&qmd(dir, &["mcp", "stop"])).contains("Stopped"));
-}
-
-#[test]
-fn a_config_a_replacement_could_not_load_keeps_the_daemon_up() {
-    let tmp = project();
-    let dir = tmp.path();
-    let _cleanup = scopeguard(dir);
-    let (port, _) = start_failing_daemon(dir);
-    let query = r#"{"query":"leaders"}"#;
-    assert!(post_query(&port, query).starts_with("HTTP/1.1 200"));
-
-    std::fs::write(dir.join(".qmd/index.yml"), "collections: [unclosed").unwrap();
-    post_query(&port, query);
     let lexical = r#"{"searches":[{"type":"lex","query":"leaders"}]}"#;
     assert!(post_query(&port, lexical).starts_with("HTTP/1.1 200"));
+}
 
-    let body = health(&port).expect("the daemon ended itself");
-    assert!(body.contains("could not restart"), "{body}");
+#[test]
+fn an_idle_daemon_ends_its_model_host_and_the_next_query_starts_another() {
+    let tmp = project();
+    let dir = tmp.path();
+    let _cleanup = scopeguard(dir);
+    let env = [("QMD_MOCK_EMBEDDER", "1"), ("QMD_MODEL_IDLE_SECONDS", "1")];
+    let (port, _) = start_daemon(dir, &env);
+    assert!(host_pids(dir).is_empty());
+
+    assert!(post_query(&port, QUERY).starts_with("HTTP/1.1 200"));
+    let host = host_pids(dir)[0];
+    assert!(is_running(host));
+
+    eventually("the model host outlived the idle time", || {
+        !is_running(host)
+    });
+    assert!(health(&port).unwrap().contains(r#""models":"unloaded""#));
+
+    assert!(post_query(&port, QUERY).starts_with("HTTP/1.1 200"));
+    assert_eq!(host_pids(dir).len(), 2);
+}
+
+#[test]
+fn stopping_the_daemon_ends_its_model_host() {
+    let tmp = project();
+    let dir = tmp.path();
+    let _cleanup = scopeguard(dir);
+    let (port, _) = start_daemon(dir, &[("QMD_MOCK_EMBEDDER", "1")]);
+    assert!(post_query(&port, QUERY).starts_with("HTTP/1.1 200"));
+    let host = host_pids(dir)[0];
+
+    assert!(qmd(dir, &["mcp", "stop"]).status.success());
+
+    eventually("the model host outlived its daemon", || !is_running(host));
 }
 
 #[test]

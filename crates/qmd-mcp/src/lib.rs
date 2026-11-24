@@ -23,7 +23,7 @@ use rmcp::ServiceExt as _;
 pub use health::EmbedderHealth;
 pub use http::HttpServer;
 pub use server::QmdServer;
-pub use worker::{EmbedderFactory, Factories, Index, Relaunch, RerankerFactory, Worker};
+pub use worker::{EmbedderFactory, Factories, Index, RerankerFactory, Worker};
 
 /// Serve MCP over stdin/stdout until the client disconnects.
 ///

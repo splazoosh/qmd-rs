@@ -1,15 +1,13 @@
-//! Whether the embedder still works, as a long-lived server last saw it.
+//! Whether the embedder works, as a long-lived server last saw it.
 //!
-//! A process can lose the GPU under a loaded model and go on answering
-//! everything that does not embed (a driver replaced under a running
-//! daemon does this), so the state lives outside the index thread, where
-//! `/health` reads it without queueing, and [`Watched`] records it on every
-//! embedding.
+//! A server can lose the GPU under a loaded model and go on answering
+//! everything that does not embed (a driver replaced under a running daemon
+//! does this), so the state lives outside the index thread, where `/health`
+//! reads it without queueing, and [`Watched`] records it on every embedding.
 //!
-//! The only recovery measured to work is a new process. Freeing the model in
-//! place is not attempted: ggml aborts when `cudaFree` fails. A failure in a
-//! process that has never embedded is left to the caller, since a new process
-//! would be in the same position; a bad load is retried by the next query.
+//! Recovery is not decided here. The embedder a server is given keeps its model
+//! in a host process and replaces a host that fails (`qmd::host`), so a failure
+//! recorded here is one a new host did not cure; the next query tries again.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -26,17 +24,18 @@ pub struct EmbedderHealth {
 struct State {
     /// Whether this process has embedded anything.
     embedded: bool,
-    can_relaunch: bool,
+    /// Whether a model is in memory.
+    models_loaded: bool,
     /// The last embedding failed with this; cleared by a success.
     failure: Option<String>,
 }
 
 impl EmbedderHealth {
-    pub(crate) fn new(can_relaunch: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(State {
                 embedded: false,
-                can_relaunch,
+                models_loaded: false,
                 failure: None,
             }),
         }
@@ -61,6 +60,16 @@ impl EmbedderHealth {
         self.state().failure.clone()
     }
 
+    /// Whether a model is in memory now: false before the first use, after an
+    /// idle unload, and after a job that left none.
+    pub fn models_loaded(&self) -> bool {
+        self.state().models_loaded
+    }
+
+    pub(crate) fn set_models_loaded(&self, loaded: bool) {
+        self.state().models_loaded = loaded;
+    }
+
     fn succeeded(&self) {
         let mut state = self.state();
         state.embedded = true;
@@ -69,36 +78,13 @@ impl EmbedderHealth {
 
     /// Record `error`, log it, and return the text a caller should read.
     pub(crate) fn failed(&self, error: &str) -> String {
-        let mut state = self.state();
-        let advice = if state.embedded && state.can_relaunch {
-            "This process can no longer embed, so the daemon is restarting in a new one: \
-             retry in a few seconds"
-        } else {
-            "Vector search is unavailable until this clears or the server is restarted \
-             ('qmd mcp stop', then start it; a stdio server restarts with its client)"
-        };
-        let message = format!("embedding failed: {error}. {advice}. Lexical searches still work");
-        eprintln!("qmd: {message}");
-        state.failure = Some(message.clone());
-        message
-    }
-
-    /// Whether the index thread should hand over to a new process.
-    pub(crate) fn relaunch_due(&self) -> bool {
-        let state = self.state();
-        state.can_relaunch && state.embedded && state.failure.is_some()
-    }
-
-    /// The new process could not be started: stay up and say so.
-    pub(crate) fn relaunch_failed(&self, error: &anyhow::Error) {
-        let mut state = self.state();
-        state.can_relaunch = false;
         let message = format!(
-            "embedding failed and the daemon could not restart itself ({error:#}). \
-             Restart it: 'qmd mcp stop', then start it. Lexical searches still work"
+            "embedding failed: {error}. Vector search is unavailable until this clears; the \
+             next query tries again. Lexical searches still work"
         );
         eprintln!("qmd: {message}");
-        state.failure = Some(message);
+        self.state().failure = Some(message.clone());
+        message
     }
 }
 

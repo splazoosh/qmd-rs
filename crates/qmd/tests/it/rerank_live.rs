@@ -18,7 +18,8 @@ use qmd::rerank::{LlamaReranker, Reranker as _};
 #[ignore = "requires the rerank model"]
 fn reranker_scores_the_answering_passage_highest() {
     let _guard = common::model_lock();
-    let reranker = LlamaReranker::load(DEFAULT_RERANK_MODEL).expect("load rerank model");
+    let reranker = LlamaReranker::load(DEFAULT_RERANK_MODEL, qmd::models::GpuMode::Auto)
+        .expect("load rerank model");
     let read = |name: &str| std::fs::read_to_string(common::eval_docs_dir().join(name)).unwrap();
     let docs = vec![
         read("distributed-systems-overview.md"),

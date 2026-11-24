@@ -11,6 +11,7 @@ pub mod chunk;
 pub mod config;
 pub mod embed;
 pub mod error;
+pub mod host;
 pub mod index;
 pub mod metadata;
 pub mod models;

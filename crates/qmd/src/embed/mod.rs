@@ -14,7 +14,9 @@ pub use generate::{
 #[cfg(feature = "llama")]
 pub use llama::{LlamaEmbedder, gpu_offload};
 #[cfg(feature = "llama")]
-pub(crate) use llama::{backend as llama_backend, take_log_errors, with_log_errors, without_nul};
+pub(crate) use llama::{
+    backend as llama_backend, model_params, take_log_errors, with_log_errors, without_nul,
+};
 
 use std::cell::Cell;
 

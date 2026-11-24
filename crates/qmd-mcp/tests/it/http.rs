@@ -267,7 +267,7 @@ async fn serve(worker: qmd_mcp::Worker) -> (SocketAddr, oneshot::Sender<()>) {
 }
 
 fn failing_after(batches: usize) -> qmd_mcp::EmbedderFactory {
-    Box::new(move |_: &str| {
+    Box::new(move |_: &str, _| {
         Ok(Box::new(qmd::embed::MockEmbedder::failing_after(batches))
             as Box<dyn qmd::embed::EmbeddingBackend>)
     })
@@ -297,7 +297,7 @@ async fn health(addr: SocketAddr) -> Value {
 #[tokio::test]
 async fn health_reports_an_embedder_that_stopped_working_and_lexical_search_goes_on() {
     let fixture = Fixture::build();
-    let (addr, _stop) = serve(fixture.worker_with(failing_after(1), None)).await;
+    let (addr, _stop) = serve(fixture.worker_with(failing_after(1))).await;
     assert_eq!(health(addr).await["embedder"], "idle");
 
     assert_eq!(plain_query(addr).await.0, 200);
@@ -311,7 +311,7 @@ async fn health_reports_an_embedder_that_stopped_working_and_lexical_search_goes
     assert_eq!(status, 400);
     let error = body["error"].as_str().unwrap();
     assert!(error.contains("mock embedder fault"), "{error}");
-    assert!(error.contains("restarted"), "{error}");
+    assert!(error.contains("tries again"), "{error}");
 
     let body = health(addr).await;
     assert_eq!(body["status"], "degraded");
@@ -336,7 +336,7 @@ async fn health_reports_an_embedder_that_stopped_working_and_lexical_search_goes
 async fn a_recovered_embedder_clears_the_degraded_state() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let loaded_once = AtomicBool::new(false);
-    let factory: qmd_mcp::EmbedderFactory = Box::new(move |_: &str| {
+    let factory: qmd_mcp::EmbedderFactory = Box::new(move |_: &str, _| {
         if loaded_once.swap(true, Ordering::Relaxed) {
             Ok(Box::new(qmd::embed::MockEmbedder::default())
                 as Box<dyn qmd::embed::EmbeddingBackend>)
@@ -345,78 +345,119 @@ async fn a_recovered_embedder_clears_the_degraded_state() {
         }
     });
     let fixture = Fixture::build();
-    let (addr, _stop) = serve(fixture.worker_with(factory, None)).await;
+    let (addr, _stop) = serve(fixture.worker_with(factory)).await;
 
     assert_eq!(plain_query(addr).await.0, 400);
-    assert_eq!(health(addr).await["status"], "degraded");
+    let failed = health(addr).await;
+    assert_eq!(failed["status"], "degraded");
+    assert_eq!(failed["models"], "unloaded", "the load failed");
     assert_eq!(plain_query(addr).await.0, 200);
     assert_eq!(health(addr).await["status"], "ok");
 }
 
-/// A relaunch hook that counts its calls and returns `result`.
-fn counting_relaunch(
-    result: fn() -> anyhow::Result<()>,
-) -> (
-    qmd_mcp::Relaunch,
+/// A mock embedder that counts itself while it is alive.
+struct Counted {
+    inner: qmd::embed::MockEmbedder,
+    alive: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.alive
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl qmd::embed::Embedder for Counted {
+    fn model_uri(&self) -> &str {
+        self.inner.model_uri()
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> qmd::Result<Vec<Option<Vec<f32>>>> {
+        self.inner.embed_batch(texts)
+    }
+}
+
+impl qmd::chunk::Tokenizer for Counted {
+    fn count_tokens(&self, text: &str) -> qmd::Result<usize> {
+        self.inner.count_tokens(text)
+    }
+
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> qmd::Result<String> {
+        self.inner.truncate_to_tokens(text, max_tokens)
+    }
+}
+
+/// A factory of [`Counted`] embedders, the GPU mode of each load, and how
+/// many are alive.
+fn counted() -> (
+    qmd_mcp::EmbedderFactory,
+    std::sync::Arc<std::sync::Mutex<Vec<qmd::models::GpuMode>>>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let calls = std::sync::Arc::new(AtomicUsize::new(0));
-    let counted = calls.clone();
-    let hook = Box::new(move || {
-        counted.fetch_add(1, Ordering::Relaxed);
-        result()
+    let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let alive = std::sync::Arc::new(AtomicUsize::new(0));
+    let (loaded, living) = (loads.clone(), alive.clone());
+    let factory: qmd_mcp::EmbedderFactory = Box::new(move |_: &str, mode| {
+        loaded.lock().unwrap().push(mode);
+        living.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(Counted {
+            inner: qmd::embed::MockEmbedder::default(),
+            alive: living.clone(),
+        }) as Box<dyn qmd::embed::EmbeddingBackend>)
     });
-    (hook, calls)
+    (factory, loads, alive)
 }
 
 #[tokio::test]
-async fn a_daemon_relaunches_only_after_it_has_embedded() {
+async fn idle_models_are_dropped_and_the_next_query_loads_them_again() {
     use std::sync::atomic::Ordering;
     let fixture = Fixture::build();
+    fixture.set_models(qmd::config::ModelsConfig {
+        gpu: Some(qmd::models::GpuMode::Cuda),
+        idle_seconds: Some(1),
+        ..Default::default()
+    });
+    let (factory, loads, alive) = counted();
+    let (addr, _stop) = serve(fixture.worker_with(factory)).await;
+    assert_eq!(health(addr).await["models"], "unloaded");
 
-    let (hook, calls) = counting_relaunch(|| Ok(()));
-    let (addr, _stop) = serve(fixture.worker_with(failing_after(0), Some(hook))).await;
-    assert_eq!(plain_query(addr).await.0, 400);
-    plain_query(addr).await;
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
-
-    let (hook, calls) = counting_relaunch(|| Ok(()));
-    let (addr, _stop) = serve(fixture.worker_with(failing_after(1), Some(hook))).await;
     assert_eq!(plain_query(addr).await.0, 200);
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
-    let (_, body) = plain_query(addr).await;
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("retry in a few seconds"),
-        "{body}"
-    );
-    plain_query(addr).await;
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(health(addr).await["models"], "loaded");
+    assert_eq!(alive.load(Ordering::Relaxed), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while health(addr).await["models"] != "unloaded" {
+        assert!(std::time::Instant::now() < deadline, "never unloaded");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(alive.load(Ordering::Relaxed), 0);
+
+    assert_eq!(plain_query(addr).await.0, 200);
+    assert_eq!(loads.lock().unwrap().len(), 2);
+    assert_eq!(health(addr).await["embedder"], "ok");
 }
 
 #[tokio::test]
-async fn a_failed_relaunch_is_reported() {
+async fn a_changed_gpu_mode_reloads_the_models_under_it() {
+    use qmd::models::GpuMode;
     let fixture = Fixture::build();
-    let (hook, _calls) = counting_relaunch(|| anyhow::bail!("no such binary"));
-    let (addr, _stop) = serve(fixture.worker_with(failing_after(1), Some(hook))).await;
-    plain_query(addr).await;
-    plain_query(addr).await;
-    reqwest::Client::new()
-        .post(format!("http://{addr}/query"))
-        .json(&json!({ "searches": [{ "type": "lex", "query": "raft" }] }))
-        .send()
-        .await
-        .unwrap();
-    let body = health(addr).await;
-    assert_eq!(body["status"], "degraded");
-    assert!(
-        body["embedderError"]
-            .as_str()
-            .unwrap()
-            .contains("no such binary"),
-        "{body}"
-    );
+    let models = |gpu| qmd::config::ModelsConfig {
+        gpu: Some(gpu),
+        idle_seconds: Some(0),
+        ..Default::default()
+    };
+    fixture.set_models(models(GpuMode::Cuda));
+    let (factory, loads, alive) = counted();
+    let (addr, _stop) = serve(fixture.worker_with(factory)).await;
+
+    assert_eq!(plain_query(addr).await.0, 200);
+    assert_eq!(plain_query(addr).await.0, 200);
+    assert_eq!(*loads.lock().unwrap(), [GpuMode::Cuda]);
+
+    fixture.set_models(models(GpuMode::Off));
+    assert_eq!(plain_query(addr).await.0, 200);
+    assert_eq!(*loads.lock().unwrap(), [GpuMode::Cuda, GpuMode::Off]);
+    assert_eq!(alive.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

@@ -6,6 +6,7 @@ pub mod hf;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::ModelsConfig;
 use crate::error::{Error, Result};
@@ -35,6 +36,99 @@ pub fn resolve_rerank_model(config: Option<&ModelsConfig>) -> String {
         "QMD_RERANK_MODEL",
         DEFAULT_RERANK_MODEL,
     )
+}
+
+/// Where the models run. `index.yml` and `QMD_LLAMA_GPU` spell the modes in
+/// lower case.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum GpuMode {
+    /// Offload to whatever GPU this build finds, and run on the CPU without one.
+    #[default]
+    Auto,
+    /// Require a CUDA device.
+    Cuda,
+    /// Require a Vulkan device.
+    Vulkan,
+    /// Require a Metal device.
+    Metal,
+    /// Run on the CPU and touch no GPU.
+    Off,
+}
+
+impl GpuMode {
+    /// The mode's spelling in `index.yml` and `QMD_LLAMA_GPU`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for GpuMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for GpuMode {
+    type Err = String;
+
+    /// Upstream's other spellings of off are accepted too.
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cuda" => Ok(Self::Cuda),
+            "vulkan" => Ok(Self::Vulkan),
+            "metal" => Ok(Self::Metal),
+            "off" | "false" | "none" | "disable" | "disabled" | "0" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown GPU mode '{other}': expected auto, cuda, vulkan, metal or off"
+            )),
+        }
+    }
+}
+
+/// Resolve the GPU mode: `models.gpu` > `QMD_LLAMA_GPU` > `auto`.
+///
+/// # Errors
+/// `QMD_LLAMA_GPU` names no mode.
+pub fn resolve_gpu_mode(config: Option<&ModelsConfig>) -> Result<GpuMode> {
+    if let Some(mode) = config.and_then(|m| m.gpu) {
+        return Ok(mode);
+    }
+    match std::env::var("QMD_LLAMA_GPU") {
+        Ok(value) if !value.trim().is_empty() => value
+            .parse()
+            .map_err(|e| Error::Config(format!("QMD_LLAMA_GPU: {e}"))),
+        _ => Ok(GpuMode::Auto),
+    }
+}
+
+/// How long a server keeps unused models loaded, when nothing says otherwise.
+pub const DEFAULT_IDLE_UNLOAD: Duration = Duration::from_secs(300);
+
+/// Resolve how long a server keeps unused models loaded: `models.idleSeconds` >
+/// `QMD_MODEL_IDLE_SECONDS` > [`DEFAULT_IDLE_UNLOAD`]. `None`, from a zero,
+/// keeps them until the server ends. An unreadable variable is the default.
+pub fn resolve_idle_unload(config: Option<&ModelsConfig>) -> Option<Duration> {
+    let seconds = config.and_then(|m| m.idle_seconds).or_else(|| {
+        std::env::var("QMD_MODEL_IDLE_SECONDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    match seconds {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(DEFAULT_IDLE_UNLOAD),
+    }
 }
 
 fn resolve_model(configured: Option<&str>, env_var: &str, default: &str) -> String {
@@ -500,11 +594,39 @@ mod tests {
     fn model_resolution_order_is_config_env_default() {
         let config = ModelsConfig {
             embed: Some("hf:a/b/c.gguf".to_owned()),
-            generate: None,
-            rerank: None,
+            ..ModelsConfig::default()
         };
         assert_eq!(resolve_embed_model(Some(&config)), "hf:a/b/c.gguf");
         assert_eq!(resolve_embed_model(None), DEFAULT_EMBED_MODEL);
+    }
+
+    #[test]
+    fn the_gpu_mode_and_idle_time_come_from_the_config_first() {
+        let config: ModelsConfig = serde_yaml_ng::from_str("gpu: off\nidleSeconds: 0\n").unwrap();
+        assert_eq!(resolve_gpu_mode(Some(&config)).unwrap(), GpuMode::Off);
+        assert_eq!(resolve_idle_unload(Some(&config)), None);
+
+        let config: ModelsConfig = serde_yaml_ng::from_str("idleSeconds: 90\n").unwrap();
+        assert_eq!(
+            resolve_idle_unload(Some(&config)),
+            Some(Duration::from_secs(90))
+        );
+        assert!(serde_yaml_ng::from_str::<ModelsConfig>("gpu: opencl\n").is_err());
+    }
+
+    #[test]
+    fn a_gpu_mode_parses_from_its_name_and_upstreams_spellings_of_off() {
+        for mode in [
+            GpuMode::Auto,
+            GpuMode::Cuda,
+            GpuMode::Vulkan,
+            GpuMode::Metal,
+            GpuMode::Off,
+        ] {
+            assert_eq!(mode.as_str().parse::<GpuMode>().unwrap(), mode);
+        }
+        assert_eq!(" FALSE ".parse::<GpuMode>().unwrap(), GpuMode::Off);
+        assert!("opencl".parse::<GpuMode>().is_err());
     }
 
     #[test]

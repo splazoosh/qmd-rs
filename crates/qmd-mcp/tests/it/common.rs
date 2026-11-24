@@ -147,29 +147,31 @@ impl Fixture {
     }
 
     pub fn worker(&self) -> Worker {
-        self.worker_with(
-            Box::new(|_: &str| Ok(Box::new(MockEmbedder::default()) as Box<dyn EmbeddingBackend>)),
-            None,
-        )
+        self.worker_with(Box::new(|_: &str, _| {
+            Ok(Box::new(MockEmbedder::default()) as Box<dyn EmbeddingBackend>)
+        }))
     }
 
-    pub fn worker_with(
-        &self,
-        factory: qmd_mcp::EmbedderFactory,
-        relaunch: Option<qmd_mcp::Relaunch>,
-    ) -> Worker {
+    pub fn worker_with(&self, factory: qmd_mcp::EmbedderFactory) -> Worker {
         Worker::spawn(
             &self.config_path,
             &self.db_path,
             qmd::embed::Embedder::model_uri(&MockEmbedder::default()).to_owned(),
             qmd_mcp::Factories {
                 embedder: factory,
-                reranker: Box::new(|_: &str| {
+                reranker: Box::new(|_: &str, _| {
                     Ok(Box::new(qmd::rerank::MockReranker) as Box<dyn qmd::rerank::Reranker>)
                 }),
-                relaunch,
+                in_memory: Box::new(|| true),
             },
         )
         .unwrap()
+    }
+
+    /// Set the `models:` section of the fixture's config.
+    pub fn set_models(&self, models: qmd::config::ModelsConfig) {
+        let mut config = qmd::config::load_config(&self.config_path).unwrap();
+        config.models = Some(models);
+        qmd::config::save_config(&self.config_path, &config).unwrap();
     }
 }

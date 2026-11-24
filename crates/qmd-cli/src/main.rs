@@ -175,12 +175,13 @@ enum Command {
         /// Run the --http server in the background, recorded in a PID file
         #[arg(long, requires = "http")]
         daemon: bool,
-        /// This process is the server --daemon started
-        #[arg(long, hide = true, requires = "http")]
-        daemon_child: bool,
-        /// This process is taking over from a daemon that lost its embedder
-        #[arg(long, hide = true, requires = "http")]
-        replacement: bool,
+    },
+    /// Hold a server's models and answer it on stdin/stdout (qmd::host)
+    #[command(hide = true)]
+    ModelHost {
+        /// The GPU mode the models run under
+        #[arg(long)]
+        gpu: qmd::models::GpuMode,
     },
 }
 
@@ -584,20 +585,8 @@ fn main() {
             port,
             ..
         } => daemon::start(&location, port),
-        Command::Mcp {
-            http,
-            port,
-            daemon_child,
-            replacement,
-            ..
-        } => {
-            let role = match (replacement, daemon_child) {
-                (true, _) => commands::McpRole::Replacement,
-                (false, true) => commands::McpRole::Daemon,
-                (false, false) => commands::McpRole::Foreground,
-            };
-            commands::mcp(&location, http.then_some(port), role)
-        }
+        Command::Mcp { http, port, .. } => commands::mcp(&location, http.then_some(port)),
+        Command::ModelHost { gpu } => commands::model_host(gpu),
     };
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
@@ -660,7 +649,11 @@ impl Command {
             Command::Mcp {
                 command, daemon, ..
             } => command.is_none() && !daemon,
-            Command::Init | Command::Update | Command::Embed { .. } | Command::Pull { .. } => false,
+            Command::Init
+            | Command::Update
+            | Command::Embed { .. }
+            | Command::Pull { .. }
+            | Command::ModelHost { .. } => false,
         }
     }
 }

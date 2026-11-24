@@ -16,6 +16,7 @@ use llama_cpp_2::token::LlamaToken;
 use crate::chunk::Tokenizer;
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
+use crate::models::GpuMode;
 
 /// Embedding context size (EmbeddingGemma's window; texts are truncated to
 /// fit, mirroring the TS context-size guard).
@@ -99,14 +100,68 @@ pub(crate) fn without_nul(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// Whether llama.cpp found a GPU to offload to: false for a build without the
-/// `cuda` feature, and for a CUDA build that sees no usable device. Loads no
-/// model.
+/// Whether models loaded under `mode` run on a GPU: false for `off`, for a
+/// build without a GPU backend, and for one that sees no usable device. Loads
+/// no model.
 ///
 /// # Errors
-/// Fails if the llama backend cannot be initialised.
-pub fn gpu_offload() -> Result<bool> {
-    Ok(backend()?.supports_gpu_offload())
+/// Fails if the llama backend cannot be initialised, or `mode` names a backend
+/// this build finds no device of.
+pub fn gpu_offload(mode: GpuMode) -> Result<bool> {
+    model_params(mode)?;
+    Ok(mode != GpuMode::Off && backend()?.supports_gpu_offload())
+}
+
+/// Model parameters that place a model where `mode` asks: every layer on the
+/// GPU, or no device at all. `off` needs the empty device list as well as zero
+/// layers, or a CUDA build still opens the device for its contexts.
+///
+/// # Errors
+/// Fails if `mode` names a backend this build finds no device of.
+pub(crate) fn model_params(mode: GpuMode) -> Result<LlamaModelParams> {
+    backend()?;
+    let params = LlamaModelParams::default();
+    let devices = match mode {
+        GpuMode::Auto => return Ok(params.with_n_gpu_layers(u32::MAX)),
+        GpuMode::Off => Vec::new(),
+        GpuMode::Cuda | GpuMode::Vulkan | GpuMode::Metal => {
+            let found = llama_cpp_2::list_llama_ggml_backend_devices();
+            let devices: Vec<usize> = found
+                .iter()
+                .filter(|d| backend_is(&d.backend, mode))
+                .map(|d| d.index)
+                .collect();
+            if devices.is_empty() {
+                let backends: Vec<&str> = found.iter().map(|d| d.backend.as_str()).collect();
+                let backends = if backends.is_empty() {
+                    "none".to_owned()
+                } else {
+                    backends.join(", ")
+                };
+                return Err(Error::Other(format!(
+                    "GPU mode '{mode}' finds no {mode} device in this build (its devices: \
+                     {backends}); use 'auto' or 'off'"
+                )));
+            }
+            devices
+        }
+    };
+    let layers = if mode == GpuMode::Off { 0 } else { u32::MAX };
+    params
+        .with_n_gpu_layers(layers)
+        .with_devices(&devices)
+        .map_err(|e| Error::Other(format!("GPU mode '{mode}': {e}")))
+}
+
+/// Whether a ggml backend registered as `name` is the one `mode` names.
+fn backend_is(name: &str, mode: GpuMode) -> bool {
+    let name = name.to_ascii_lowercase();
+    match mode {
+        GpuMode::Cuda => name == "cuda",
+        GpuMode::Vulkan => name == "vulkan",
+        GpuMode::Metal => name == "mtl" || name == "metal",
+        GpuMode::Auto | GpuMode::Off => false,
+    }
 }
 
 /// GGUF embedding model loaded through llama.cpp.
@@ -116,17 +171,16 @@ pub struct LlamaEmbedder {
 }
 
 impl LlamaEmbedder {
-    /// Load the model for `model_uri`, downloading it on first use.
-    ///
-    /// GPU offload is requested for all layers; a CPU-only build simply
-    /// ignores it and runs on the CPU.
+    /// Load the model for `model_uri` where `mode` asks, downloading it on
+    /// first use.
     ///
     /// # Errors
-    /// Fails on download or model-load errors.
-    pub fn load(model_uri: &str) -> Result<Self> {
+    /// Fails on download or model-load errors, and on a `mode` this build has
+    /// no device for.
+    pub fn load(model_uri: &str, mode: GpuMode) -> Result<Self> {
         let path = crate::models::ensure_model(model_uri)?;
         let backend = backend()?;
-        let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+        let params = model_params(mode)?;
         take_log_errors();
         let model = LlamaModel::load_from_file(backend, &path, &params).map_err(|e| {
             Error::Other(format!(
@@ -237,6 +291,15 @@ impl Tokenizer for LlamaEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backend_is_matched_by_the_name_ggml_registers() {
+        assert!(backend_is("CUDA", GpuMode::Cuda));
+        assert!(backend_is("MTL", GpuMode::Metal));
+        assert!(backend_is("Vulkan", GpuMode::Vulkan));
+        assert!(!backend_is("CUDA", GpuMode::Vulkan));
+        assert!(!backend_is("CPU", GpuMode::Auto));
+    }
 
     #[test]
     fn a_nul_becomes_a_space_and_clean_text_is_not_copied() {

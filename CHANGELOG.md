@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.0
+
+- A `qmd mcp` server, on stdio or HTTP, no longer holds its models: they run
+  in a child process, `qmd model-host`, started by the first query that needs
+  one. When no model has been used for five minutes the server ends that
+  process, which gives its memory back, and the next query starts another;
+  `models.idleSeconds` in `index.yml` or `QMD_MODEL_IDLE_SECONDS` sets the
+  time, and 0 keeps the models. `GET /health` reports `models` as `loaded` or
+  `unloaded`.
+- A lost GPU no longer ends or restarts the server. A model process that fails
+  or dies is replaced and the query answered; the daemon no longer hands over
+  to a new process on its port. If a new model process cannot use the GPU
+  either, `auto` tries one on the CPU, and once that has answered stays there
+  until the models are next unloaded.
+- The GPU mode can be chosen: `models.gpu` in `index.yml`, or `QMD_LLAMA_GPU`,
+  as `auto` (the default), `cuda`, `vulkan`, `metal` or `off`. `off` opens no
+  GPU device. A named mode the build has no device for is an error. `qmd
+  status` shows where the models run.
+
 ## 0.8.0
 
 - `qmd archive rm <url>` removes an archived item whole, its revisions and

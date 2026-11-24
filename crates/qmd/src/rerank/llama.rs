@@ -6,12 +6,12 @@ use std::num::NonZeroU32;
 
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 
-use crate::embed::{llama_backend, take_log_errors, with_log_errors, without_nul};
+use crate::embed::{llama_backend, model_params, take_log_errors, with_log_errors, without_nul};
 use crate::error::{Error, Result};
+use crate::models::GpuMode;
 use crate::rerank::Reranker;
 
 /// Context per scored pair; documents are truncated to fit beside the prompt.
@@ -33,15 +33,16 @@ pub struct LlamaReranker {
 }
 
 impl LlamaReranker {
-    /// Load the model for `model_uri`, downloading it on first use.
+    /// Load the model for `model_uri` where `mode` asks, downloading it on
+    /// first use.
     ///
     /// # Errors
-    /// Fails on download or model-load errors, and on a template without a
-    /// `{document}` slot.
-    pub fn load(model_uri: &str) -> Result<Self> {
+    /// Fails on download or model-load errors, and on a `mode` this build has
+    /// no device for.
+    pub fn load(model_uri: &str, mode: GpuMode) -> Result<Self> {
         let path = crate::models::ensure_model(model_uri)?;
         let backend = llama_backend()?;
-        let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+        let params = model_params(mode)?;
         take_log_errors();
         let model = LlamaModel::load_from_file(backend, &path, &params).map_err(|e| {
             Error::Other(format!(
